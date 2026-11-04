@@ -17,6 +17,7 @@ from the card, so going back only takes inserting the original card.
 | Microphone | `snd-tsw-audin` module (card `TSW1060Mic`); no PulseAudio source yet, the gain is not tuned |
 | Backlight | `tsw-backlight`: auto brightness, dim and off when idle |
 | Network | random MAC per card: created on the first boot, kept in `/etc/default/tsw-mac` |
+| USB | keyboards, mice and other USB devices work when connected (verified) |
 
 The image has no graphical environment. Programs draw directly to `/dev/dri/card0`.
 
