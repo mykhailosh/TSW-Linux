@@ -20,11 +20,76 @@ from the card, so going back only takes inserting the original card.
 
 The image has no graphical environment. Programs draw directly to `/dev/dri/card0`.
 
+## Getting the original card image
+
+The build needs an image of the microSD card that came with the panel. Power the panel off before taking
+the card out, and take the image before anything else: the card is the only way back to the original
+system. The image holds Crestron files and data of that panel, so keep it private.
+
+The card is read in full below, which gives you a backup. The build itself only uses the first 80 MiB.
+
+### Linux
+
+Find the card by its size and model; below it is `/dev/sdX` (a built-in reader shows `/dev/mmcblk0`):
+
+```bash
+lsblk -o NAME,SIZE,MODEL,TRAN
+```
+
+Unmount it and make it read-only, so nothing can change it by accident:
+
+```bash
+sudo umount /dev/sdX?*
+```
+
+```bash
+sudo blockdev --setro /dev/sdX
+```
+
+Read the card and compare the copy with it:
+
+```bash
+sudo dd if=/dev/sdX of=crestron-card.img bs=4M conv=fsync status=progress
+```
+
+```bash
+sudo cmp /dev/sdX crestron-card.img
+```
+
+`cmp` prints nothing when the copy is identical. To take only what the build needs, add `bs=1M count=80` to
+`dd` instead of `bs=4M`, and skip `cmp`.
+
+### Windows
+
+Use [USBImager](https://gitlab.com/bztsrc/usbimager), the regular build: the write-only (`wo`) build has no
+Read button.
+
+All partitions on the card have the Linux type, so Windows gives them no drive letter and may offer to format
+the card. **Refuse: formatting destroys the original system.** Without a drive letter the card is hidden from
+USBImager's default list, so it must be started with `-a`, which lists every disk.
+
+1. Find the card's disk number in PowerShell, by its size and bus type:
+
+   ```powershell
+   Get-Disk | Select-Object Number, FriendlyName, BusType, @{n='GB';e={[math]::Round($_.Size/1GB,1)}}
+   ```
+
+2. Start PowerShell as Administrator, go to the USBImager folder and run:
+
+   ```powershell
+   .\usbimager.exe -a
+   ```
+
+3. Select the card in the device list. The list includes the system disks, so check the size against step 1.
+4. Press **Read**, never **Write**. The image is saved to the Desktop as `usbimager-<date>T<time>.dd`.
+
+Pass this file to the build. From WSL, the Desktop is under `/mnt/c/Users/<user>/Desktop/`.
+
 ## Building
 
-You need Debian 12 or Ubuntu 22.04+ on x86_64, root, internet and an **original Crestron card image**. The
-first 80 MiB come from it: the U-Boot copy, its environment and the FAT partition. That image is not in this
-repository.
+You need Debian 12 or Ubuntu 22.04+ on x86_64, root, internet and an **original Crestron card image** (see
+above). The first 80 MiB come from it: the U-Boot copy, its environment and the FAT partition. That image is
+not in this repository. If it is not a Crestron card image, the build stops at the environment check.
 
 ```bash
 sudo ./build_tsw_mainline.sh <Crestron card image> tsw-1060.img
