@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# The Crestron bootloader leaves the Cortex-A9 JTAG routed to pins GPIOAO_8..11,
+# which are the I2S lines to the ZL38051 (MCLK/BCLK/LRCLK/DATA). While JTAG is on,
+# neither I2S nor GPIO reach the pins: no sound. The Crestron kernel disabled JTAG
+# itself; mainline does not know this register (AO_SECURE_REG1, 0xda004004: 0x102 -> 0).
+REG=0xda004004
+
+case "$1" in
+  start|restart|reload|force-reload)
+    out=$(python3 - "$REG" <<'PY'
+import mmap, os, struct, sys
+a = int(sys.argv[1], 0)
+m = mmap.mmap(os.open('/dev/mem', os.O_RDWR | os.O_SYNC), 4096, offset=a & ~0xfff)
+o = a & 0xfff
+v = struct.unpack_from('<I', m, o)[0]
+struct.pack_into('<I', m, o, 0)
+print('AO_SECURE_REG1 %#x -> %#x' % (v, struct.unpack_from('<I', m, o)[0]))
+PY
+    ) && echo "tsw-jtag-off: $out" > /dev/kmsg || echo "tsw-jtag-off: ERROR $out" > /dev/kmsg
+    ;;
+  stop) ;;
+  status)
+    python3 -c "import mmap,os,struct;m=mmap.mmap(os.open('/dev/mem',os.O_RDONLY|os.O_SYNC),4096,mmap.MAP_SHARED,mmap.PROT_READ,offset=0xda004000);print('AO_SECURE_REG1 %#x (0 = JTAG off)'%struct.unpack_from('<I',m,4)[0])"
+    ;;
+  *) echo "Usage: $0 start|status"; exit 1 ;;
+esac
+exit 0

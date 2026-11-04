@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+/*
+ * Crestron TSW-1060: variant for TFA9890 DSP mode (vendor Jabil profile,
+ * stereo.cnt) loaded from userspace. The mainline tfa989x driver (DSP
+ * bypass only) is kept off the amplifiers; the I2S link ends in a dummy
+ * codec, the amplifiers at i2c-1 0x34/0x36 are left to the loader.
+ */
+#include "meson8m2-crestron-tsw1060.dts"
+
+/ {
+	dummy_codec: audio-codec-dummy {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "TFA DSP";
+	};
+};
+
+&{/sound/dai-link-1} {
+	/delete-node/ codec-0;
+	/delete-node/ codec-1;
+
+	codec {
+		sound-dai = <&dummy_codec>;
+	};
+};
+
+&speaker_left {
+	status = "disabled";
+};
+
+&speaker_right {
+	status = "disabled";
+};

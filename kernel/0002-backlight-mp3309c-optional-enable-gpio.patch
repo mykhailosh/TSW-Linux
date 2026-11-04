@@ -1,0 +1,13 @@
+diff --git a/drivers/video/backlight/mp3309c.c b/drivers/video/backlight/mp3309c.c
+index 372058e26..69b4f8e97 100644
+--- a/drivers/video/backlight/mp3309c.c
++++ b/drivers/video/backlight/mp3309c.c
+@@ -238,7 +238,7 @@ static int mp3309c_parse_fwnode(struct mp3309c_chip *chip,
+ 		num_levels = ANALOG_I2C_NUM_LEVELS;
+ 
+ 		/* Enable GPIO used in I2C dimming mode only */
+-		chip->enable_gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_HIGH);
++		chip->enable_gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_HIGH);
+ 		if (IS_ERR(chip->enable_gpio))
+ 			return dev_err_probe(dev, PTR_ERR(chip->enable_gpio),
+ 					     "error getting enable gpio\n");

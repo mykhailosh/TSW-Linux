@@ -1,0 +1,14 @@
+[Unit]
+Description=TSW-1060: Ethernet MAC (random per card, /etc/default/tsw-mac)
+DefaultDependencies=no
+Wants=network-pre.target sys-subsystem-net-devices-eth0.device
+After=local-fs.target sys-subsystem-net-devices-eth0.device
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tsw-mac
+
+[Install]
+WantedBy=multi-user.target

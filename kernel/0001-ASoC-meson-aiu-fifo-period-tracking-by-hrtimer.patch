@@ -1,0 +1,216 @@
+diff --git a/sound/soc/meson/aiu-fifo.c b/sound/soc/meson/aiu-fifo.c
+index b222bde1f..0ae446a8e 100644
+--- a/sound/soc/meson/aiu-fifo.c
++++ b/sound/soc/meson/aiu-fifo.c
+@@ -6,6 +6,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/dma-mapping.h>
++#include <linux/hrtimer.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dai.h>
+@@ -55,6 +56,77 @@ static void aiu_fifo_enable(struct snd_soc_dai *dai, bool enable)
+ 				      en_mask, enable ? en_mask : 0);
+ }
+ 
++static unsigned int aiu_fifo_cur_period(struct aiu_fifo *fifo)
++{
++	struct snd_pcm_runtime *runtime = fifo->substream->runtime;
++	unsigned int addr;
++
++	addr = snd_soc_component_read(fifo->component,
++				      fifo->mem_offset + AIU_MEM_RD);
++	addr -= (unsigned int)runtime->dma_addr;
++
++	return bytes_to_frames(runtime, addr) / runtime->period_size;
++}
++
++static enum hrtimer_restart aiu_fifo_timer_cb(struct hrtimer *timer)
++{
++	struct aiu_fifo *fifo = container_of(timer, struct aiu_fifo, timer);
++	unsigned int period;
++
++	if (!atomic_read(&fifo->running))
++		return HRTIMER_NORESTART;
++
++	period = aiu_fifo_cur_period(fifo);
++	if (period != fifo->last_period) {
++		fifo->last_period = period;
++		snd_pcm_period_elapsed(fifo->substream);
++	}
++
++	if (!atomic_read(&fifo->running))
++		return HRTIMER_NORESTART;
++
++	hrtimer_forward_now(timer, fifo->interval);
++	return HRTIMER_RESTART;
++}
++
++static void aiu_fifo_timer_start(struct snd_pcm_substream *substream,
++				 struct snd_soc_dai *dai)
++{
++	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	u64 ns;
++
++	fifo->component = dai->component;
++	fifo->substream = substream;
++
++	/* poll 4 times per period, but not more often than every 2 ms */
++	ns = div_u64((u64)runtime->period_size * NSEC_PER_SEC, runtime->rate) / 4;
++	fifo->interval = ns_to_ktime(max_t(u64, ns, 2 * NSEC_PER_MSEC));
++	fifo->last_period = aiu_fifo_cur_period(fifo);
++
++	atomic_set(&fifo->running, 1);
++	hrtimer_start(&fifo->timer, fifo->interval, HRTIMER_MODE_REL_SOFT);
++}
++
++static void aiu_fifo_timer_stop(struct snd_soc_dai *dai)
++{
++	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
++
++	atomic_set(&fifo->running, 0);
++	if (!hrtimer_callback_running(&fifo->timer))
++		hrtimer_try_to_cancel(&fifo->timer);
++}
++
++int aiu_fifo_sync_stop(struct snd_soc_component *component,
++		       struct snd_pcm_substream *substream)
++{
++	struct aiu_fifo *fifo =
++		snd_soc_dai_dma_data_get_playback(aiu_fifo_dai(substream));
++
++	hrtimer_cancel(&fifo->timer);
++	return 0;
++}
++
+ int aiu_fifo_trigger(struct snd_pcm_substream *substream, int cmd,
+ 		     struct snd_soc_dai *dai)
+ {
+@@ -63,10 +135,12 @@ int aiu_fifo_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 		aiu_fifo_enable(dai, true);
++		aiu_fifo_timer_start(substream, dai);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 	case SNDRV_PCM_TRIGGER_STOP:
++		aiu_fifo_timer_stop(dai);
+ 		aiu_fifo_enable(dai, false);
+ 		break;
+ 	default:
+@@ -122,10 +196,7 @@ int aiu_fifo_hw_params(struct snd_pcm_substream *substream,
+ 
+ static irqreturn_t aiu_fifo_isr(int irq, void *dev_id)
+ {
+-	struct snd_pcm_substream *playback = dev_id;
+-
+-	snd_pcm_period_elapsed(playback);
+-
++	/* periods are tracked by aiu_fifo_timer_cb(), see aiu-fifo.h */
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -153,6 +224,18 @@ int aiu_fifo_startup(struct snd_pcm_substream *substream,
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The buffer must hold a whole number of periods: the FIFO raises
++	 * its interrupt every IRQ_BLOCK bursts, and with a ragged last period
++	 * the interrupt after the buffer wrap comes a full period late. ALSA
++	 * then assumes a missed wrap, advances hw_ptr by a whole buffer and
++	 * reports a spurious underrun (audible click) once per buffer turn.
++	 */
++	ret = snd_pcm_hw_constraint_integer(substream->runtime,
++					    SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		return ret;
++
+ 	ret = clk_prepare_enable(fifo->pclk);
+ 	if (ret)
+ 		return ret;
+@@ -170,6 +253,7 @@ void aiu_fifo_shutdown(struct snd_pcm_substream *substream,
+ {
+ 	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
+ 
++	hrtimer_cancel(&fifo->timer);
+ 	free_irq(fifo->irq, substream);
+ 	clk_disable_unprepare(fifo->pclk);
+ }
+@@ -200,6 +284,10 @@ int aiu_fifo_dai_probe(struct snd_soc_dai *dai)
+ 	if (!fifo)
+ 		return -ENOMEM;
+ 
++	hrtimer_init(&fifo->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
++	fifo->timer.function = aiu_fifo_timer_cb;
++	atomic_set(&fifo->running, 0);
++
+ 	snd_soc_dai_dma_data_set_playback(dai, fifo);
+ 
+ 	return 0;
+@@ -209,6 +297,7 @@ int aiu_fifo_dai_remove(struct snd_soc_dai *dai)
+ {
+ 	struct aiu_fifo *fifo = snd_soc_dai_dma_data_get_playback(dai);
+ 
++	hrtimer_cancel(&fifo->timer);
+ 	kfree(fifo);
+ 
+ 	return 0;
+diff --git a/sound/soc/meson/aiu-fifo.h b/sound/soc/meson/aiu-fifo.h
+index b02cfcc4d..0e801f05a 100644
+--- a/sound/soc/meson/aiu-fifo.h
++++ b/sound/soc/meson/aiu-fifo.h
+@@ -7,6 +7,9 @@
+ #ifndef _MESON_AIU_FIFO_H
+ #define _MESON_AIU_FIFO_H
+ 
++#include <linux/atomic.h>
++#include <linux/hrtimer.h>
++
+ struct snd_pcm_hardware;
+ struct snd_soc_component_driver;
+ struct snd_soc_dai_driver;
+@@ -23,6 +26,19 @@ struct aiu_fifo {
+ 	unsigned int fifo_block;
+ 	struct clk *pclk;
+ 	int irq;
++
++	/*
++	 * Period tracking by polling: on Meson8 the FIFO interrupt does not
++	 * follow AIU_MEM_I2S_MASKS IRQ_BLOCK (it fires only sporadically), so
++	 * period boundaries are detected with an hrtimer, like the vendor
++	 * driver did.
++	 */
++	struct hrtimer timer;
++	ktime_t interval;
++	atomic_t running;
++	unsigned int last_period;
++	struct snd_soc_component *component;
++	struct snd_pcm_substream *substream;
+ };
+ 
+ int aiu_fifo_dai_probe(struct snd_soc_dai *dai);
+@@ -31,6 +47,8 @@ int aiu_fifo_dai_remove(struct snd_soc_dai *dai);
+ snd_pcm_uframes_t aiu_fifo_pointer(struct snd_soc_component *component,
+ 				   struct snd_pcm_substream *substream);
+ 
++int aiu_fifo_sync_stop(struct snd_soc_component *component,
++		       struct snd_pcm_substream *substream);
+ int aiu_fifo_trigger(struct snd_pcm_substream *substream, int cmd,
+ 		     struct snd_soc_dai *dai);
+ int aiu_fifo_prepare(struct snd_pcm_substream *substream,
+diff --git a/sound/soc/meson/aiu.c b/sound/soc/meson/aiu.c
+index f2890111c..96f0058dc 100644
+--- a/sound/soc/meson/aiu.c
++++ b/sound/soc/meson/aiu.c
+@@ -101,6 +101,7 @@ static const struct snd_soc_component_driver aiu_cpu_component = {
+ 	.num_dapm_routes	= ARRAY_SIZE(aiu_cpu_dapm_routes),
+ 	.of_xlate_dai_name	= aiu_cpu_of_xlate_dai_name,
+ 	.pointer		= aiu_fifo_pointer,
++	.sync_stop		= aiu_fifo_sync_stop,
+ 	.probe			= aiu_cpu_component_probe,
+ 	.remove			= aiu_cpu_component_remove,
+ #ifdef CONFIG_DEBUG_FS

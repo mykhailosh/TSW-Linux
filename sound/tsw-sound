@@ -1,0 +1,33 @@
+#!/bin/sh
+# Run by tsw-sound.service (tsw-jtag-off.service is done before it).
+# Order: PulseAudio keeps the device open (the I2S clock
+# never stops) -> tsw-tfa start loads the DSP firmware and profile into the amplifiers.
+PA=/usr/bin/pulseaudio
+TFA=/usr/local/bin/tsw-tfa
+VOL=${TSW_VOLUME:-60%}
+PCM=/proc/asound/card0/pcm0p/sub0/status
+log() { echo "tsw-sound: $*" > /dev/kmsg 2>/dev/null; echo "tsw-sound: $*"; }
+
+case "$1" in
+  start)
+    if ! pgrep -x pulseaudio >/dev/null; then
+        $PA --system --daemonize --disallow-exit --disallow-module-loading --log-target=syslog \
+            --high-priority --realtime || { log "ERROR: PulseAudio failed to start"; exit 1; }
+    fi
+    i=0; while ! grep -q RUNNING $PCM 2>/dev/null; do
+        i=$((i+1)); [ $i -gt 50 ] && { log "PulseAudio did not open hw:0,0 within 10 s"; break; }; sleep 0.2
+    done
+    sleep 0.5
+    if out=$($TFA start 2>&1); then log "$(echo $out)"; else log "ERROR tsw-tfa: $(echo $out)"; fi
+    pactl -s unix:/var/run/pulse/native set-sink-volume tsw "$VOL" 2>/dev/null
+    ;;
+  stop)
+    $TFA stop >/dev/null 2>&1
+    pkill -x pulseaudio
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  dsp)     $TFA start ;;                    # reload the profile into the amplifiers
+  status)  $TFA status; pactl -s unix:/var/run/pulse/native list short sinks 2>/dev/null ;;
+  *) echo "Usage: $0 start|stop|restart|dsp|status"; exit 1 ;;
+esac
+exit 0

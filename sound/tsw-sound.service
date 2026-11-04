@@ -1,0 +1,14 @@
+[Unit]
+Description=TSW-1060 sound (system PulseAudio + TFA9890 DSP with Jabil profile)
+After=local-fs.target sound.target tsw-jtag-off.service
+Wants=tsw-jtag-off.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/tsw-sound
+ExecStart=/usr/local/sbin/tsw-sound start
+ExecStop=/usr/local/sbin/tsw-sound stop
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=TSW-1060: release pins GPIOAO_8..11 to audio (disable JTAG)
+DefaultDependencies=no
+After=local-fs.target
+Before=sound.target basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tsw-jtag-off start
+
+[Install]
+WantedBy=sysinit.target

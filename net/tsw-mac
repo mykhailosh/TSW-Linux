@@ -1,0 +1,14 @@
+#!/bin/sh
+# TSW-1060 Ethernet MAC: random, one per card; kept in /etc/default/tsw-mac (put your own there and reboot).
+# The address is created on the first boot, not in the image, so every card gets its own.
+CONF=${TSW_MAC_CONF:-/etc/default/tsw-mac}
+IF=eth0
+[ -r "$CONF" ] && . "$CONF"
+if [ -z "$MAC" ]; then
+    # 02: locally administered, unicast
+    MAC=02$(od -An -tx1 -N5 /dev/urandom | sed 's/ /:/g')
+    printf '# /etc/default/tsw-mac - TSW-1060 Ethernet MAC (random, set on the first boot)\nMAC=%s\n' "$MAC" > "$CONF"
+    sync "$CONF"
+fi
+ip link set dev "$IF" down
+ip link set dev "$IF" address "$MAC" && echo "tsw-mac: $IF = $MAC"

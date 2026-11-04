@@ -1,0 +1,14 @@
+# /etc/default/tsw-buttons - TSW-1060 side buttons (touch keys of the FT5822 touch controller)
+TOUCH_NAME=ft5x06              # part of the real touchscreen input device name
+BUTTON_X=1320                  # the buttons are reported as touches at this x (off the screen) ...
+BUTTON_Y=100 250 400 550 700   # ... and these y, top to bottom
+BUTTON_TOL=0                   # allowed deviation of x/y
+# Per button, top to bottom: POWER (screen on/off via tsw-backlight), NONE, a key name
+# (F13..F24, HOMEPAGE, UP, DOWN, VOLUMEUP, VOLUMEDOWN, ENTER, ESC, BACK, ...) or a Linux key code.
+KEYS=POWER F13 F14 F15 F16
+LIGHT=yes                      # drive the button light (PWM_C)
+LIGHT_ON=keep                  # duty % while the screen is on (keep = as left by U-Boot)
+LIGHT_DIM=keep                 # duty % while dimmed (keep = same as LIGHT_ON)
+LIGHT_OFF=0                    # duty % while the screen is off
+LIGHT_PRESS=100                # duty % of the flash on a press
+LIGHT_FLASH=0.3                # flash length, s

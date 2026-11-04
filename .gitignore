@@ -1,0 +1,19 @@
+# images and build tree
+*.img
+*.img.xz
+*_env_original.bin
+tsw-mainline-build/
+
+# kernel module build output
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# recordings
+*.wav

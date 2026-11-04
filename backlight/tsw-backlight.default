@@ -1,0 +1,11 @@
+# /etc/default/tsw-backlight - TSW-1060 backlight (MP3309C, levels 0..31)
+MIN_LEVEL=2          # lowest level used by auto brightness
+MAX_LEVEL=23         # highest level (the vendor kernel never went above 23)
+AUTO=yes             # auto brightness from the MAX44009 light sensor
+FIXED_LEVEL=12       # brightness when AUTO=no
+LUX_FULL=500         # ambient light (lux) at which MAX_LEVEL is reached
+DIM_AFTER=60         # seconds without touch -> dim (0 = never)
+DIM_LEVEL=2          # brightness while dimmed
+OFF_AFTER=600        # seconds without touch -> backlight off (0 = never)
+SWALLOW_WAKE=off     # off | dim | never: the waking touch is not passed to apps
+TOUCH_NAME=TSW-1060 touchscreen,ft5x06    # touchscreen device name parts, preferred first (tsw-buttons creates the first)

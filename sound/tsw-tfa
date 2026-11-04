@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+tsw-tfa - NXP TFA9890 amplifiers of the Crestron TSW-1060 panel in DSP mode with the
+Jabil speaker profile (as in Android), without Android tools: the I2C sequences were
+recorded by tracing climax_hostSW with the settings_yushan/stereo.cnt container and are
+stored in tsw-tfa-jabil.json.
+
+  tsw-tfa start   - full (cold) start: reset, profile registers, DSP firmware patch,
+                    speaker model, SpeakerBoost config, 10 EQ biquads, amp on (< 1 s).
+                    Sounds better than the warm start (verified by ear).
+  tsw-tfa cold    - same as start
+  tsw-tfa warm    - profile only (SpeakerBoost + EQ), like climax does with ACS=0
+  tsw-tfa stop    - switch the amplifiers off
+  tsw-tfa status  - show amplifier state
+
+NOTE: an I2S stream (clock) must be running during start, otherwise the DSP won't boot.
+Requires the DTB where the tfa989x driver does not claim 0x34/0x36 (TSW1060-TFADSP.DTB).
+Bus /dev/i2c-1, left 0x34, right 0x36.
+"""
+import ctypes, fcntl, json, os, sys, time
+
+BUS = '/dev/i2c-1'
+DATA = os.environ.get('TSW_TFA_DATA', '/usr/local/share/tsw-tfa/tsw-tfa-jabil.json')
+I2C_RDWR, I2C_M_RD = 0x0707, 0x0001
+ST_ACS, ST_SWS, ST_AMPS, ST_CLKS, ST_PLLS = 0x0800, 0x1000, 0x4000, 0x0040, 0x0002
+
+
+class Msg(ctypes.Structure):
+    _fields_ = [('addr', ctypes.c_uint16), ('flags', ctypes.c_uint16),
+                ('len', ctypes.c_uint16), ('buf', ctypes.c_char_p)]
+
+
+class RdWr(ctypes.Structure):
+    _fields_ = [('msgs', ctypes.POINTER(Msg)), ('nmsgs', ctypes.c_uint32)]
+
+
+class Bus:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR)
+
+    def _xfer(self, msgs):
+        arr = (Msg * len(msgs))(*msgs)
+        fcntl.ioctl(self.fd, I2C_RDWR, RdWr(arr, len(msgs)))
+
+    def write(self, addr, reg, data):
+        buf = ctypes.create_string_buffer(bytes([reg]) + data, 1 + len(data))
+        self._xfer([Msg(addr, 0, len(data) + 1, ctypes.cast(buf, ctypes.c_char_p))])
+
+    def read(self, addr, reg, n):
+        wb = ctypes.create_string_buffer(bytes([reg]), 1)
+        rb = ctypes.create_string_buffer(n)
+        self._xfer([Msg(addr, 0, 1, ctypes.cast(wb, ctypes.c_char_p)),
+                    Msg(addr, I2C_M_RD, n, ctypes.cast(rb, ctypes.c_char_p))])
+        return rb.raw[:n]
+
+    def rd16(self, addr, reg):
+        return int.from_bytes(self.read(addr, reg, 2), 'big')
+
+    def wr16(self, addr, reg, val):
+        self.write(addr, reg, val.to_bytes(2, 'big'))
+
+
+def log(msg):
+    print('tsw-tfa:', msg)
+    try:
+        with open('/dev/kmsg', 'w') as k:
+            k.write('tsw-tfa: %s\n' % msg)
+    except OSError:
+        pass
+
+
+def poll(fn, cond, timeout):
+    t = time.time() + timeout
+    while True:
+        v = fn()
+        if cond(v):
+            return v, True
+        if time.time() > t:
+            return v, False
+        time.sleep(0.005)
+
+
+def run(bus, addr, ops):
+    """Replay a recorded sequence; reads become waits/checks."""
+    n = len(ops)
+    i = 0
+    while i < n:
+        op = ops[i]
+        if op[0] == 'w':
+            reg, data = op[1], bytes.fromhex(op[2])
+            bus.write(addr, reg, data)
+            if reg == 0x70 and data[:2] == b'\x00\x00':
+                time.sleep(0.01)          # DSP released from reset
+            i += 1
+            continue
+        _, reg, ln, exp = op
+        exp = int(exp, 16)
+        if reg == 0x00:
+            # a run of status reads is a wait: wait for the state the run ended with
+            j = i
+            while j + 1 < n and ops[j + 1][0] == 'r' and ops[j + 1][1] == 0x00:
+                j += 1
+            want = int(ops[j][3], 16)
+            mask = ST_SWS | ST_AMPS | ST_CLKS | ST_PLLS
+            v, ok = poll(lambda: bus.rd16(addr, 0x00), lambda v: (v & mask) == (want & mask), 2.0)
+            if not ok:
+                log('%#x: status %#06x, expected %#06x (mask %#06x), continuing' % (addr, v, want, mask))
+            i = j + 1
+            continue
+        if reg == 0x73:
+            v, ok = poll(lambda: bus.rd16(addr, 0x73), lambda v: v & 0x0100, 0.5)
+            if not ok:
+                raise RuntimeError('%#x: DSP did not acknowledge the message (CF_STATUS=%#06x)' % (addr, v))
+            i += 1
+            continue
+        if reg == 0x72 and ln == 3:
+            v = int.from_bytes(bus.read(addr, 0x72, 3), 'big')
+            if exp == 0x31 and v != 0x31:
+                raise RuntimeError('%#x: DSP ROM tag %#x, the profile was recorded for 0x31' % (addr, v))
+            if exp == 0 and v != 0:
+                raise RuntimeError('%#x: DSP returned error %#x' % (addr, v))
+            i += 1
+            continue
+        bus.read(addr, reg, ln)          # other reads: as in the original, not checked
+        i += 1
+
+
+def status(bus):
+    for addr in AMPS:
+        st, sc, i2s, sel, ac = (bus.rd16(addr, r) for r in (0x00, 0x09, 0x04, 0x0a, 0x06))
+        flags = ' '.join(n for b, n in ((0x8000, 'AREFS'), (ST_AMPS, 'AMPS'), (ST_SWS, 'SWS'), (ST_ACS, 'ACS'),
+                                         (ST_CLKS, 'CLKS'), (ST_PLLS, 'PLLS')) if st & b)
+        dsp = 'DSP' if (i2s >> 6) & 3 == 2 else 'bypass'
+        print('%#x: status=%#06x [%s] sysctrl=%#06x i2s=%#06x (%s) i2ssel=%#06x audio=%#06x'
+              % (addr, st, flags, sc, i2s, dsp, sel, ac))
+
+
+def stop(bus):
+    for addr in AMPS:
+        sc = bus.rd16(addr, 0x09)
+        bus.wr16(addr, 0x09, sc & ~0x0008)                       # AMPE=0
+        poll(lambda: bus.rd16(addr, 0x00), lambda v: not v & ST_SWS, 1.0)
+        bus.wr16(addr, 0x09, (sc & ~0x0008) | 0x0001)            # PWDN=1
+    log('amplifiers off')
+
+
+AMPS = (0x34, 0x36)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ''
+    if cmd not in ('start', 'cold', 'warm', 'stop', 'status'):
+        sys.exit(__doc__)
+    bus = Bus(BUS)
+    if cmd == 'status':
+        return status(bus)
+    if cmd == 'stop':
+        return stop(bus)
+    seq = json.load(open(DATA))['amps']
+    for addr in AMPS:
+        if bus.rd16(addr, 0x03) & 0xff != 0x80:
+            sys.exit('%#x: not a TFA9890' % addr)
+        st = bus.rd16(addr, 0x00)
+        mode = 'warm' if cmd == 'warm' else 'cold'
+        if not st & ST_CLKS:
+            log('%#x: no I2S clock (status %#06x), start playback first' % (addr, st))
+        t = time.time()
+        run(bus, addr, seq['%#x' % addr][mode])
+        log('%#x: %s start in %.2f s, status %#06x' % (addr, mode,
+                                                     time.time() - t, bus.rd16(addr, 0x00)))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError) as e:
+        log('ERROR: %s' % e)
+        sys.exit(1)

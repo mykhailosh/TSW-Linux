@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+tsw-mic-check - read-only check of the TSW-1060 microphone path, before writing a capture driver.
+
+Path (from the Crestron DTB and the Jabil ZL38051 config):
+  2 digital mics -> ZL38051 (AEC, beamforming) -> TDMA ch1/ch2 out -> GPIOY_5 (i2s_in_ch01)
+  -> AUDIN I2S input (clocked by AIU, like the playback) -> AUDIN FIFO0 -> DDR.
+Mainline Linux has no AUDIN (Meson8 audio input) driver, so nothing records yet.
+
+  tsw-mic-check          - ZL38051 routing, pin mux, AUDIN clock gate and registers, data pin activity
+  tsw-mic-check pin [s]  - only sample the data pin for s seconds (default 3) - talk / tap near the panel
+  tsw-mic-check level f.wav - peak / RMS per 0.5 s of a recording (16- or 32-bit wav)
+  tsw-mic-check gain [v] - show / set the ZL38051 gain of the AEC output to the SoC
+                           (CpTdma1Gain, CpTdma2Gain; Jabil value 0)
+  tsw-mic-check zl addr [v] - read / write any ZL38051 register
+
+Only "gain" and "zl ... v" change anything: ZL38051 RAM, lost at power-off (its flash is not
+touched). Otherwise /dev/mem is mapped read-only and the ZL38051 is only read.
+Playback should be running (tsw-sound / PulseAudio keeps the I2S clock on).
+"""
+import ctypes, fcntl, mmap, os, struct, sys, time
+
+BUS, ZL = '/dev/i2c-1', 0x45
+I2C_RDWR, I2C_M_RD = 0x0707, 0x0001
+
+# ZL38051 registers: address -> (name, value in the Jabil 10" config)
+ZL_REGS = [
+    (0x0202, 'CpAudioPathEnb', 0x1CCC),
+    (0x0214, 'CpTdma1Src (to SoC, L)', 0x000E),
+    (0x0216, 'CpTdma2Src (to SoC, R)', 0x000E),
+    (0x021C, 'CpTdmb1Src (to amp L)', 0x0005),
+    (0x021E, 'CpTdmb2Src (to amp R)', 0x0006),
+    (0x0224, 'CpAecSinSrc (mic)', 0x0003),
+    (0x0226, 'CpAecRinSrc (echo ref)', 0x000A),
+    (0x0228, 'CpAecSin2Src (mic 2)', 0x0002),
+    (0x023C, 'CpTdma1Gain', 0x0000),
+    (0x023E, 'CpTdma2Gain', 0x0000),
+    (0x0260, 'TdmaCfg', 0x8004),
+    (0x0262, 'TdmaClkCfg', 0x03F6),
+    (0x0264, 'TdmaPcmCfg', 0xC0C0),
+    (0x0268, 'TdmaCh1Cfg', 0x0100),
+    (0x026A, 'TdmaCh2Cfg', 0x0101),
+    (0x02B0, 'DigMicCfg', 0x0006),
+    (0x02B2, 'DigiMicGain', 0x0003),
+    (0x04C0, 'NumMics', 0x0002),
+]
+
+CBUS = 0xc1100000
+HHI_GCLK_MPEG1 = CBUS + 0x1051 * 4           # bit 2 = AUDIN gate (GCLK_AUD_IN, mainline "i2s_spdif")
+RESET_LEVEL2 = 0xc1104488                    # bit 1 = RESET_AUDIN (1 = released)
+PIN_MUX = CBUS + 0x202c * 4                  # PERIPHS_PIN_MUX_0
+GPIO = CBUS + 0x8030                         # mainline "gpio" region; bank Y: in = reg 5
+GPIOY_IN, GPIOY_DIR = GPIO + 5 * 4, GPIO + 3 * 4
+AUDIN = [('I2SIN_CTRL', 0x2810), ('SOURCE_SEL', 0x2811), ('FIFO0_START', 0x2820),
+         ('FIFO0_END', 0x2821), ('FIFO0_PTR', 0x2822), ('FIFO0_CTRL', 0x2825),
+         ('FIFO0_CTRL1', 0x2826), ('FIFO0_PIO_STS', 0x28b0), ('INT_CTRL', 0x2851)]
+
+
+class Msg(ctypes.Structure):
+    _fields_ = [('addr', ctypes.c_uint16), ('flags', ctypes.c_uint16),
+                ('len', ctypes.c_uint16), ('buf', ctypes.c_char_p)]
+
+
+class RdWr(ctypes.Structure):
+    _fields_ = [('msgs', ctypes.POINTER(Msg)), ('nmsgs', ctypes.c_uint32)]
+
+
+class Zl:
+    """ZL38051 HBI over I2C: page 0 direct access; other pages: select page (0xFE, page - 1,
+    as in the Microsemi zl380tw driver) and paged read in the same write."""
+
+    def __init__(self):
+        self.fd = os.open(BUS, os.O_RDWR)
+
+    def _xfer(self, msgs):
+        arr = (Msg * len(msgs))(*msgs)
+        fcntl.ioctl(self.fd, I2C_RDWR, RdWr(arr, len(msgs)))
+
+    @staticmethod
+    def _cmd(addr, write):
+        page, off = addr >> 8, (addr & 0xff) >> 1
+        n = 0x80 if write else 0           # length byte: words - 1, bit 7 = write
+        if page == 0:
+            return [0x80 | off, n]
+        return [0xfe, page - 1 if page != 0xff else page, off, n]
+
+    def write(self, addr, val):
+        cmd = self._cmd(addr, True) + [val >> 8 & 0xff, val & 0xff]
+        wb = ctypes.create_string_buffer(bytes(cmd), len(cmd))
+        self._xfer([Msg(ZL, 0, len(cmd), ctypes.cast(wb, ctypes.c_char_p))])
+
+    def read(self, addr):
+        cmd = self._cmd(addr, False)
+        wb = ctypes.create_string_buffer(bytes(cmd), len(cmd))
+        rb = ctypes.create_string_buffer(2)
+        self._xfer([Msg(ZL, 0, len(cmd), ctypes.cast(wb, ctypes.c_char_p)),
+                    Msg(ZL, I2C_M_RD, 2, ctypes.cast(rb, ctypes.c_char_p))])
+        return int.from_bytes(rb.raw[:2], 'big')
+
+
+class Mem:
+    def __init__(self):
+        self.fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
+        self.maps = {}
+
+    def map(self, a):
+        base = a & ~0xfff
+        if base not in self.maps:
+            self.maps[base] = mmap.mmap(self.fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
+        return self.maps[base], a & 0xfff
+
+    def rd(self, a):
+        m, o = self.map(a)
+        return struct.unpack_from('<I', m, o)[0]
+
+
+def check_zl():
+    print('== ZL38051 (i2c-1 0x45) ==')
+    try:
+        zl = Zl()
+        bad = 0
+        for addr, name, want in ZL_REGS:
+            v = zl.read(addr)
+            mark = '' if v == want else '   <- config file has 0x%04x' % want
+            bad += v != want
+            print('  0x%04x %-24s 0x%04x%s' % (addr, name, v, mark))
+        print('  0x00e0 (0x03f6 = I2S clock seen)  0x%04x' % zl.read(0x00e0))
+        print('  all as in the Jabil config' if not bad else '  %d register(s) differ' % bad)
+    except OSError as e:
+        print('  ERROR: %s' % e)
+
+
+def check_soc(mem):
+    print('== SoC ==')
+    g = mem.rd(HHI_GCLK_MPEG1)
+    print('  HHI_GCLK_MPEG1 %#010x: AUDIN gate (bit 2) %s, AIU (bit 15) %s'
+          % (g, 'on' if g & 4 else 'OFF', 'on' if g & 0x8000 else 'OFF'))
+    print('  AUDIN reset level: %s' % ('released' if mem.rd(RESET_LEVEL2) & 2 else 'HELD IN RESET'))
+    m1, m3, m4 = (mem.rd(PIN_MUX + 4 * i) for i in (1, 3, 4))
+    print('  GPIOY_5 mux: i2s_in_ch01 (MUX1 bit 5) %d, pcm_in_b (MUX4 bit 24) %d, MUX3 bit 15 %d'
+          % (m1 >> 5 & 1, m4 >> 24 & 1, m3 >> 15 & 1))
+    print('  GPIOY_5 direction %s' % ('input' if mem.rd(GPIOY_DIR) >> 5 & 1 else 'OUTPUT'))
+    for name, r in AUDIN:
+        print('  AUDIN_%-14s %#010x' % (name, mem.rd(CBUS + r * 4)))
+
+
+def sample_pin(mem, secs):
+    m, o = mem.map(GPIOY_IN)
+    unpack = struct.unpack_from
+    n = ones = edges = 0
+    last = None
+    t_end = time.time() + secs
+    print('== data pin GPIOY_5, sampling %g s ==' % secs)
+    while time.time() < t_end:
+        for _ in range(5000):
+            b = unpack('<I', m, o)[0] >> 5 & 1
+            ones += b
+            if b != last:
+                edges += 1
+                last = b
+        n += 5000
+    print('  %d samples, high %.1f %%, %d changes' % (n, 100.0 * ones / n, edges - 1))
+    if edges <= 1:
+        print('  pin is static: no data from the ZL38051 (or no I2S clock)')
+    else:
+        print('  pin toggles: the ZL38051 is sending data to the SoC')
+
+
+def wav_levels(path):
+    import array, math, wave
+    w = wave.open(path)
+    ch, rate, width = w.getnchannels(), w.getframerate(), w.getsampwidth()
+    if width not in (2, 4):
+        sys.exit('tsw-mic-check: need a 16- or 32-bit wav')
+    full = 32768.0 if width == 2 else 2147483648.0
+    print('== %s: %d ch, %d Hz, %d bit, %.1f s ==' % (path, ch, rate, 8 * width, w.getnframes() / rate))
+    step = rate // 2
+    t = 0.0
+    bits = 0
+    while True:
+        d = array.array('h' if width == 2 else 'i', w.readframes(step))
+        if not d:
+            break
+        cols = []
+        for c in range(ch):
+            s = d[c::ch]
+            for x in s:
+                bits |= x & 0xffffffff
+            rms = math.sqrt(sum(float(x) * x for x in s) / len(s))
+            peak = max(abs(x) for x in s)
+            cols.append('peak %5.1f dBFS rms %5.1f dBFS' % (
+                20 * math.log10(peak / full) if peak else -99, 20 * math.log10(rms / full) if rms else -99))
+        print('  %5.1f s  %s' % (t, ' | '.join(cols)))
+        t += 0.5
+    if width == 4:
+        # 32-bit capture = the raw 24-bit word << 8: shows which bits carry the sample
+        print('  bits ever set: %08x (word bits 23..0 = %06x)' % (bits, bits >> 8))
+
+
+def zl_cmd(args):
+    zl = Zl()
+    if args[0] == 'gain':
+        regs = [0x023C, 0x023E]            # CpTdma1Gain, CpTdma2Gain: AEC output to the SoC
+        if len(args) > 1:
+            v = int(args[1], 0) & 0xffff
+            for r in regs:
+                zl.write(r, v)
+        print('CpTdma1Gain 0x%04x CpTdma2Gain 0x%04x' % tuple(zl.read(r) for r in regs))
+    else:
+        addr = int(args[1], 0)
+        if len(args) > 2:
+            zl.write(addr, int(args[2], 0) & 0xffff)
+        print('0x%04x = 0x%04x' % (addr, zl.read(addr)))
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] == 'level':
+        wav_levels(sys.argv[2])
+        return
+    if os.geteuid():
+        sys.exit('tsw-mic-check: run as root')
+    if len(sys.argv) > 1 and sys.argv[1] in ('gain', 'zl'):
+        zl_cmd(sys.argv[1:])
+        return
+    mem = Mem()
+    if len(sys.argv) > 1 and sys.argv[1] == 'pin':
+        sample_pin(mem, float(sys.argv[2]) if len(sys.argv) > 2 else 3)
+        return
+    check_zl()
+    check_soc(mem)
+    sample_pin(mem, 2)
+
+
+if __name__ == '__main__':
+    main()

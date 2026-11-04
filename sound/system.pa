@@ -1,0 +1,11 @@
+#!/usr/bin/pulseaudio -nF
+# TSW-1060 (mainline 6.12): system-wide PulseAudio.
+# The device never suspends on idle (no module-suspend-on-idle): the I2S clock always
+# runs, otherwise the TFA9890 DSP loses the Jabil profile (sound becomes "flat").
+# Hardware: AIU I2S -> ZL38051 -> 2x TFA9890, 48 kHz / 16 bit only.
+load-module module-alsa-sink device=hw:0,0 sink_name=tsw sink_properties=device.description=TSW-1060 rate=48000 format=s16le channels=2 tsched=1
+load-module module-native-protocol-unix auth-anonymous=1
+load-module module-default-device-restore
+load-module module-stream-restore restore_device=false
+load-module module-always-sink
+set-default-sink tsw

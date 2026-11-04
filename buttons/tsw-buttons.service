@@ -1,0 +1,13 @@
+[Unit]
+Description=TSW-1060 side buttons: touch keys -> keyboard, button light
+After=local-fs.target systemd-modules-load.service systemd-udevd.service
+Before=tsw-backlight.service
+
+[Service]
+ExecStartPre=-/sbin/modprobe uinput
+ExecStart=/usr/bin/python3 /usr/local/bin/tsw-buttons run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

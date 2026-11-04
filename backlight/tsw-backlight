@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+tsw-backlight - TSW-1060 backlight daemon (MP3309C via the mainline mp3309c driver).
+
+  * auto brightness from the MAX44009 ambient light sensor (IIO),
+  * dims after DIM_AFTER seconds without touches, switches off after OFF_AFTER,
+  * the first touch on a dark/dimmed screen only wakes it up and is NOT passed to
+    the applications (the touchscreen is grabbed while the screen sleeps),
+  * smooth fades,
+  * SIGUSR1 toggles the screen on/off, SIGUSR2 is activity (wakes it up) - sent by tsw-buttons;
+    the current state is published in /run/tsw-backlight.state ("<pid> <on|dim|off> <grab|->").
+
+Settings: /etc/default/tsw-backlight.   Usage: tsw-backlight [run|status|set N]
+`set N` writes a fixed level and exits (useful for testing; the daemon keeps running).
+"""
+import fcntl, glob, math, os, select, signal, struct, sys, time
+
+CONF = '/etc/default/tsw-backlight'
+STATE = '/run/tsw-backlight.state'
+DEFAULTS = {
+    'MIN_LEVEL': '2',        # lowest level used by auto brightness (driver: 0..31)
+    'MAX_LEVEL': '23',       # highest level (the vendor kernel never went above 23)
+    'AUTO': 'yes',           # auto brightness from the light sensor
+    'FIXED_LEVEL': '12',     # used when AUTO=no
+    'LUX_FULL': '500',       # lux at which MAX_LEVEL is reached (log scale)
+    'DIM_AFTER': '60',       # seconds without touch -> dim (0 = never)
+    'DIM_LEVEL': '2',
+    'OFF_AFTER': '600',      # seconds without touch -> off (0 = never)
+    'SWALLOW_WAKE': 'off',   # off | dim | never: when the waking touch is swallowed
+    # substrings of the touchscreen input device name, in order of preference
+    # (tsw-buttons replaces the real ft5x06 device with a filtered virtual one)
+    'TOUCH_NAME': 'TSW-1060 touchscreen,ft5x06',
+}
+EVIOCGRAB = 0x40044590
+EV_FMT = 'llHHi'             # struct input_event (native long = 32 bit on armhf)
+EV_SIZE = struct.calcsize(EV_FMT)
+EV_KEY, EV_ABS, BTN_TOUCH, ABS_MT_TRACKING_ID = 0x01, 0x03, 0x14a, 0x39
+
+
+def log(msg):
+    print('tsw-backlight:', msg, flush=True)
+    try:
+        with open('/dev/kmsg', 'w') as k:
+            k.write('tsw-backlight: %s\n' % msg)
+    except OSError:
+        pass
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    try:
+        for line in open(CONF):
+            line = line.split('#', 1)[0].strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                c[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    return c
+
+
+def find_backlight():
+    for d in sorted(glob.glob('/sys/class/backlight/*')):
+        try:
+            if 'mp3309c' in os.readlink(os.path.join(d, 'device', 'driver')):
+                return d
+        except OSError:
+            continue
+    d = sorted(glob.glob('/sys/class/backlight/*'))
+    return d[0] if d else None
+
+
+def find_lux():
+    for d in glob.glob('/sys/bus/iio/devices/iio:device*'):
+        f = os.path.join(d, 'in_illuminance_input')
+        if os.path.exists(f):
+            return f
+    return None
+
+
+def find_touch(name):
+    for d in sorted(glob.glob('/sys/class/input/event*')):
+        try:
+            n = open(os.path.join(d, 'device', 'name')).read().strip()
+        except OSError:
+            continue
+        if name.lower() in n.lower():
+            return '/dev/input/' + os.path.basename(d), n
+    return None, None
+
+
+class Backlight:
+    def __init__(self, path):
+        self.path = path
+        self.max_hw = int(open(path + '/max_brightness').read())
+        self.cur = int(open(path + '/actual_brightness').read())
+        self.failed = False
+
+    def write(self, level):
+        level = max(0, min(self.max_hw, int(level)))
+        if level == self.cur:
+            return
+        try:
+            with open(self.path + '/brightness', 'w') as f:
+                f.write(str(level))
+            self.cur = level
+            if self.failed:
+                log('backlight responds again')
+                self.failed = False
+        except OSError as e:
+            if not self.failed:
+                log('ERROR: cannot set brightness (%s), will retry' % e)
+            self.failed = True
+            time.sleep(2)
+
+    def fade(self, target, step_s=0.04):
+        target = max(0, min(self.max_hw, int(target)))
+        while self.cur != target:
+            self.write(self.cur + (1 if target > self.cur else -1))
+            if self.failed:
+                return
+            time.sleep(step_s)
+
+
+def lux_to_level(lux, c):
+    lo, hi, full = int(c['MIN_LEVEL']), int(c['MAX_LEVEL']), float(c['LUX_FULL'])
+    x = math.log10(max(lux, 0) + 1) / math.log10(full + 1)
+    return round(lo + (hi - lo) * max(0.0, min(1.0, x)))
+
+
+def run():
+    c = load_conf()
+    bl_path = find_backlight()
+    if not bl_path:
+        log('ERROR: no backlight device (is the mp3309c driver loaded?)')
+        sys.exit(1)
+    bl = Backlight(bl_path)
+    hi = min(int(c['MAX_LEVEL']), bl.max_hw)
+    lux_file = find_lux() if c['AUTO'] == 'yes' else None
+    names = [n.strip() for n in c['TOUCH_NAME'].split(',') if n.strip()]
+    dim_after, off_after = float(c['DIM_AFTER']), float(c['OFF_AFTER'])
+    log('backlight %s (0..%d, using up to %d), light sensor %s'
+        % (bl_path, bl.max_hw, hi, lux_file or 'off'))
+
+    state = 'on'             # on | dim | off
+    grabbed = False
+    last_touch = time.monotonic()
+    last_lux_t = 0.0
+    target = int(c['FIXED_LEVEL'])
+    lux_avg = None
+    tfd, trank, last_scan = None, len(names), 0.0   # touch fd, its place in TOUCH_NAME
+    published = None
+    req = {'toggle': False, 'wake': False}
+    signal.signal(signal.SIGUSR1, lambda *_: req.update(toggle=True))
+    signal.signal(signal.SIGUSR2, lambda *_: req.update(wake=True))
+
+    def close_touch():
+        nonlocal tfd, trank, grabbed
+        if tfd is not None:
+            os.close(tfd)                 # also drops the grab
+        tfd, trank, grabbed = None, len(names), False
+
+    def open_touch():
+        """Switch to a better touch device (earlier in TOUCH_NAME) if one appeared."""
+        nonlocal tfd, trank
+        for i, n in enumerate(names[:trank]):
+            dev, nm = find_touch(n)
+            if not dev:
+                continue
+            try:
+                fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            close_touch()
+            tfd, trank = fd, i
+            log('touch input %s (%s)' % (dev, nm))
+            if state != 'on':
+                grab(swallow(state))
+            return
+
+    def publish():
+        nonlocal published
+        s = '%d %s %s\n' % (os.getpid(), state, 'grab' if grabbed else '-')
+        if s != published:
+            try:
+                with open(STATE + '.tmp', 'w') as f:
+                    f.write(s)
+                os.replace(STATE + '.tmp', STATE)
+                published = s
+            except OSError:
+                pass
+
+    def grab(on):
+        nonlocal grabbed
+        if tfd is None or grabbed == on:
+            return
+        try:
+            fcntl.ioctl(tfd, EVIOCGRAB, 1 if on else 0)
+            grabbed = on
+        except OSError as e:
+            log('touch grab failed: %s' % e)
+
+    def swallow(st):
+        return c['SWALLOW_WAKE'] == st or (c['SWALLOW_WAKE'] == 'dim' and st in ('dim', 'off'))
+
+    while True:
+        publish()
+        now = time.monotonic()
+        if trank > 0 and now - last_scan > 5:          # no touch yet, or not the preferred one
+            last_scan = now
+            open_touch()
+        # --- ambient light (every 2 s, smoothed) ---
+        if lux_file and now - last_lux_t > 2:
+            last_lux_t = now
+            try:
+                lux = float(open(lux_file).read())
+                lux_avg = lux if lux_avg is None else 0.7 * lux_avg + 0.3 * lux
+                target = lux_to_level(lux_avg, c)
+            except (OSError, ValueError):
+                pass
+        target = min(target, hi)
+
+        # --- idle timers ---
+        idle = now - last_touch
+        if state == 'on':
+            if off_after and idle >= off_after and (not dim_after or off_after <= dim_after):
+                state = 'off'; bl.fade(0); grab(swallow('off'))
+            elif dim_after and idle >= dim_after:
+                state = 'dim'; bl.fade(min(int(c['DIM_LEVEL']), target)); grab(swallow('dim'))
+            else:
+                if bl.cur != target:            # follow ambient light slowly
+                    bl.write(bl.cur + (1 if target > bl.cur else -1))
+        elif state == 'dim' and off_after and idle >= off_after:
+            state = 'off'; bl.fade(0); grab(swallow('off'))
+
+        # --- touches ---
+        r = []
+        if tfd is not None:
+            r, _, _ = select.select([tfd], [], [], 0.25)
+        else:
+            time.sleep(0.25)
+        # --- requests from tsw-buttons ---
+        if req['toggle'] or req['wake']:
+            toggle = req['toggle']
+            req.update(toggle=False, wake=False)
+            last_touch = time.monotonic()
+            if toggle and state == 'on':
+                state = 'off'; bl.fade(0); grab(swallow('off'))
+            elif state != 'on':
+                state = 'on'; bl.fade(target, 0.015); grab(False)
+        if r:
+            touched = released = False
+            try:
+                while True:
+                    data = os.read(tfd, EV_SIZE * 64)
+                    if not data:
+                        break
+                    for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
+                        _, _, typ, code, val = struct.unpack_from(EV_FMT, data, i)
+                        if (typ == EV_KEY and code == BTN_TOUCH) or (typ == EV_ABS and code == ABS_MT_TRACKING_ID):
+                            if (typ == EV_KEY and val == 1) or (typ == EV_ABS and val >= 0):
+                                touched = True
+                            else:
+                                released = True
+            except BlockingIOError:
+                pass
+            except OSError as e:                         # device gone (e.g. tsw-buttons restarted)
+                log('touch input lost (%s)' % e)
+                close_touch()
+                continue
+            last_touch = time.monotonic()
+            if state != 'on':
+                state = 'on'
+                bl.fade(target, 0.015)
+                if grabbed:                       # swallow the whole waking touch
+                    t_end = time.monotonic() + 3
+                    while not released and time.monotonic() < t_end:
+                        rr, _, _ = select.select([tfd], [], [], 0.2)
+                        if not rr:
+                            break                 # no more events: finger lifted (or no release event)
+                        try:
+                            data = os.read(tfd, EV_SIZE * 64)
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            break
+                        for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
+                            _, _, typ, code, val = struct.unpack_from(EV_FMT, data, i)
+                            if (typ == EV_KEY and code == BTN_TOUCH and val == 0) or \
+                               (typ == EV_ABS and code == ABS_MT_TRACKING_ID and val < 0):
+                                released = True
+                    grab(False)
+            del touched
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'run'
+    if cmd == 'run':
+        run()
+    elif cmd == 'status':
+        p = find_backlight()
+        if not p:
+            sys.exit('no backlight device')
+        lf = find_lux()
+        lux = open(lf).read().strip() if lf else '-'
+        print('%s: brightness %s / max %s, light sensor %s lux' % (
+            p, open(p + '/actual_brightness').read().strip(), open(p + '/max_brightness').read().strip(), lux))
+    elif cmd == 'set' and len(sys.argv) > 2:
+        p = find_backlight()
+        if not p:
+            sys.exit('no backlight device')
+        with open(p + '/brightness', 'w') as f:
+            f.write(str(int(sys.argv[2])))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main()

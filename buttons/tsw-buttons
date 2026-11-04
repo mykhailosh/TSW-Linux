@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+tsw-buttons - TSW-1060 side buttons daemon.
+
+The 5 side buttons are touch keys of the FT5822 touch controller: a press is reported as a
+touch at x=1320 (beyond the 1280 px screen), y=100/250/400/550/700 (top to bottom). The daemon grabs the touchscreen, passes
+real touches on to a virtual touchscreen ("TSW-1060 touchscreen") and turns the button touches
+into keys of a virtual keyboard ("TSW-1060 buttons").
+
+  * POWER action: screen on/off through tsw-backlight (SIGUSR1),
+  * other buttons: keys from /etc/default/tsw-buttons (default F13..F16); every press is also
+    activity for tsw-backlight (SIGUSR2), and a press on a dark screen only wakes it up,
+  * button light (PWM_C on GPIODV_29): flashes on a press, follows the screen state.
+
+Settings: /etc/default/tsw-buttons.   Usage: tsw-buttons [run|debug]
+`debug` runs in the foreground and prints every button press.
+"""
+import fcntl, glob, mmap, os, select, signal, struct, sys, time
+
+CONF = '/etc/default/tsw-buttons'
+BL_STATE = '/run/tsw-backlight.state'    # written by tsw-backlight: "<pid> <on|dim|off> <grab|->"
+DEFAULTS = {
+    'TOUCH_NAME': 'ft5x06',              # substring of the real touchscreen input device name
+    'BUTTON_X': '1320',                  # x of the button touches (off the screen, x max is 1279)
+    'BUTTON_Y': '100 250 400 550 700',   # y of the buttons, top to bottom
+    'BUTTON_TOL': '0',                   # allowed deviation of x/y (the controller reports exact values)
+    'KEYS': 'POWER F13 F14 F15 F16',     # per button, top to bottom: POWER, NONE, key name or number
+    'LIGHT': 'yes',                      # drive the button light (PWM_C)
+    'LIGHT_ON': 'keep',                  # duty % while the screen is on (keep = as left by U-Boot)
+    'LIGHT_DIM': 'keep',                 # duty % while dimmed (keep = same as LIGHT_ON)
+    'LIGHT_OFF': '0',                    # duty % while the screen is off
+    'LIGHT_PRESS': '100',                # duty % of the flash on a press
+    'LIGHT_FLASH': '0.3',                # flash length, s
+}
+KEYNAMES = {
+    'ESC': 1, 'ENTER': 28, 'SPACE': 57, 'BACKSPACE': 14, 'TAB': 15,
+    'UP': 103, 'LEFT': 105, 'RIGHT': 106, 'DOWN': 108, 'PAGEUP': 104, 'PAGEDOWN': 109, 'HOME': 102, 'END': 107,
+    'MUTE': 113, 'VOLUMEDOWN': 114, 'VOLUMEUP': 115, 'POWER': 116, 'SLEEP': 142, 'WAKEUP': 143,
+    'SCREENLOCK': 152, 'BACK': 158, 'HOMEPAGE': 172, 'MENU': 139, 'LIGHTS_TOGGLE': 0x21e,
+    'BRIGHTNESSDOWN': 224, 'BRIGHTNESSUP': 225, 'PLAYPAUSE': 164,
+}
+KEYNAMES.update({'F%d' % i: 58 + i for i in range(1, 11)})       # F1..F10 = 59..68
+KEYNAMES.update({'F11': 87, 'F12': 88})
+KEYNAMES.update({'F%d' % i: 170 + i for i in range(13, 25)})     # F13..F24 = 183..194
+
+EV_FMT = 'llHHi'; EV_SIZE = struct.calcsize(EV_FMT)
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+SYN_REPORT, SYN_DROPPED = 0, 3
+BTN_TOUCH = 0x14a
+ABS_X, ABS_Y, ABS_PRESSURE = 0x00, 0x01, 0x18
+ABS_MT_SLOT, ABS_MT_FIRST, ABS_MT_X, ABS_MT_Y, ABS_MT_TID, ABS_MT_LAST = 0x2f, 0x30, 0x35, 0x36, 0x39, 0x3f
+EMULATED = {(EV_KEY, BTN_TOUCH), (EV_ABS, ABS_X), (EV_ABS, ABS_Y), (EV_ABS, ABS_PRESSURE)} | \
+           {(EV_KEY, c) for c in range(0x145, 0x150)}          # BTN_TOOL_* (we regenerate BTN_TOUCH/ABS_X/ABS_Y)
+
+EVIOCGRAB = 0x40044590
+EVIOCGBIT = lambda ev, n: 0x80004520 | (n << 16) | ev
+EVIOCGPROP = lambda n: 0x80004509 | (n << 16)
+EVIOCGABS = lambda a: 0x80184540 + a
+EVIOCGMTSLOTS = lambda n: 0x8000450a | (n << 16)
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_ABSBIT, UI_SET_PROPBIT = 0x40045564, 0x40045565, 0x40045567, 0x4004556e
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+BUS_VIRTUAL = 0x06
+
+PWM_PAGE, PWM_C = 0xc1108000, 0x650      # PWM_PWM_C = hi << 16 | lo
+
+DEBUG = False
+
+
+def log(msg):
+    print('tsw-buttons:', msg, flush=True)
+    if DEBUG:
+        return
+    try:
+        with open('/dev/kmsg', 'w') as k:
+            k.write('tsw-buttons: %s\n' % msg)
+    except OSError:
+        pass
+
+
+def load_conf():
+    c = dict(DEFAULTS)
+    try:
+        for line in open(CONF):
+            line = line.split('#', 1)[0].strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                c[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    return c
+
+
+def bits(fd, req, nbytes):
+    buf = bytearray(nbytes)
+    try:
+        fcntl.ioctl(fd, req, buf)
+    except OSError:
+        return []
+    return [i for i in range(nbytes * 8) if buf[i >> 3] >> (i & 7) & 1]
+
+
+def find_input(name):
+    for d in sorted(glob.glob('/sys/class/input/event*')):
+        try:
+            n = open(os.path.join(d, 'device', 'name')).read().strip()
+        except OSError:
+            continue
+        if name.lower() in n.lower():
+            return '/dev/input/' + os.path.basename(d), n
+    return None, None
+
+
+class UInput:
+    """A virtual input device (legacy uinput_user_dev setup, works on every kernel)."""
+
+    def __init__(self, name, keys=(), absinfo=None, props=()):
+        self.fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+        absinfo = absinfo or {}
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+        if keys:
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for k in keys:
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+        if absinfo:
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+            for a in absinfo:
+                fcntl.ioctl(self.fd, UI_SET_ABSBIT, a)
+        for p in props:
+            fcntl.ioctl(self.fd, UI_SET_PROPBIT, p)
+        amax, amin, afuzz, aflat = ([0] * 64 for _ in range(4))
+        for a, (lo, hi, fuzz, flat) in absinfo.items():
+            amin[a], amax[a], afuzz[a], aflat[a] = lo, hi, fuzz, flat
+        os.write(self.fd, struct.pack('=80s4HI256i', name.encode()[:79], BUS_VIRTUAL, 0x1d0c, 0x1060, 1, 0,
+                                      *(amax + amin + afuzz + aflat)))
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def send(self, events):
+        if events:
+            events = list(events) + [(EV_SYN, SYN_REPORT, 0)]
+            os.write(self.fd, b''.join(struct.pack(EV_FMT, 0, 0, t, c, v) for t, c, v in events))
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+class ButtonLight:
+    """Side button light: PWM_C duty cycle, written straight to the register via /dev/mem."""
+
+    def __init__(self, c):
+        fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+        self.m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=PWM_PAGE)
+        os.close(fd)
+        hi, lo = self.regs()
+        self.period = hi + lo
+        if self.period == 0:
+            raise OSError('PWM_C is not running (hi = lo = 0)')
+        self.initial = (hi, lo)
+        start = 100.0 * hi / self.period
+        pct = lambda k, dflt: dflt if c[k] == 'keep' else float(c[k])
+        self.levels = {'on': pct('LIGHT_ON', start)}
+        self.levels['dim'] = pct('LIGHT_DIM', self.levels['on'])
+        self.levels['off'] = float(c['LIGHT_OFF'])
+        self.press, self.flash_s = float(c['LIGHT_PRESS']), float(c['LIGHT_FLASH'])
+        self.state, self.flash_end, self.cur = 'on', 0.0, None
+        log('button light: PWM_C hi %d lo %d (%.0f %%), on %.0f %%, dim %.0f %%, off %.0f %%'
+            % (hi, lo, start, self.levels['on'], self.levels['dim'], self.levels['off']))
+        self.set(self.levels['on'])
+
+    def regs(self):
+        v = struct.unpack_from('<I', self.m, PWM_C)[0]
+        return v >> 16, v & 0xffff
+
+    def set(self, pct):
+        hi = round(self.period * max(0.0, min(100.0, pct)) / 100)
+        if hi != self.cur:
+            struct.pack_into('<I', self.m, PWM_C, hi << 16 | (self.period - hi))
+            self.cur = hi
+
+    def flash(self):
+        self.flash_end = time.monotonic() + self.flash_s
+        self.set(self.press)
+
+    def tick(self, state):
+        self.state = state or 'on'
+        if time.monotonic() >= self.flash_end:
+            self.flash_end = 0.0
+            self.set(self.levels.get(self.state, self.levels['on']))
+
+    def restore(self):
+        hi, lo = self.initial
+        struct.pack_into('<I', self.m, PWM_C, hi << 16 | lo)
+
+
+def backlight_state():
+    """(pid, state, grabbed) of a running tsw-backlight, or None."""
+    try:
+        pid, state, grab = open(BL_STATE).read().split()[:3]
+        pid = int(pid)
+        os.kill(pid, 0)
+        return pid, state, grab == 'grab'
+    except (OSError, ValueError):
+        return None
+
+
+class Slot:
+    def __init__(self):
+        self.axes = {ABS_MT_TID: -1}
+        self.button = None       # index of the button this contact is, or None
+        self.active = False      # contact passed on to the virtual touchscreen
+        self.seq = 0             # start order, for the pointer emulation (oldest contact)
+
+
+class Filter:
+    def __init__(self, c, src_fd, absinfo, cur_slot, light):
+        self.bx, self.tol = int(c['BUTTON_X']), int(c['BUTTON_TOL'])
+        self.by = [int(v) for v in c['BUTTON_Y'].split()]
+        self.actions = []
+        for k in c['KEYS'].split():
+            k = k.upper()
+            self.actions.append(k if k in ('POWER', 'NONE') else (KEYNAMES[k] if k in KEYNAMES else int(k, 0)))
+        self.actions += ['NONE'] * (len(self.by) - len(self.actions))
+        self.light = light
+        nslots = absinfo.get(ABS_MT_SLOT, (0, 0, 0, 0))[1] + 1
+        self.slots = [Slot() for _ in range(nslots)]
+        # the kernel only reports values that changed, so start from its current slot values
+        for a in [a for a in absinfo if ABS_MT_FIRST <= a <= ABS_MT_LAST]:
+            buf = bytearray(4 + 4 * nslots)
+            struct.pack_into('I', buf, 0, a)
+            try:
+                fcntl.ioctl(src_fd, EVIOCGMTSLOTS(len(buf)), buf)
+            except OSError:
+                continue
+            for i, v in enumerate(struct.unpack_from('%di' % nslots, buf, 4)):
+                self.slots[i].axes[a] = v
+        for s in self.slots:                   # contacts already down are not passed on
+            s.axes[ABS_MT_TID] = -1
+        self.cur = cur_slot if 0 <= cur_slot < nslots else 0
+        self.seq = 0
+        self.btn_touch = 0
+        self.has_xy = ABS_X in absinfo
+        self.frame = []
+        self.dropped = False
+        self.swallowed = set()
+        self.touch = UInput('TSW-1060 touchscreen', bits(src_fd, EVIOCGBIT(EV_KEY, 96), 96) or [BTN_TOUCH],
+                            absinfo, bits(src_fd, EVIOCGPROP(4), 4))
+        self.kbd = UInput('TSW-1060 buttons', sorted({a for a in self.actions if isinstance(a, int)}))
+
+    def match(self, x, y):
+        if abs(x - self.bx) > self.tol:
+            return None
+        for i, by in enumerate(self.by):
+            if abs(y - by) <= self.tol:
+                return i
+        return None
+
+    def event(self, typ, code, val):
+        if typ == EV_SYN and code == SYN_DROPPED:
+            self.dropped, self.frame = True, []
+        elif typ == EV_SYN and code == SYN_REPORT:
+            if not self.dropped:
+                self.process(self.frame)
+            self.dropped, self.frame = False, []
+        elif not self.dropped:
+            self.frame.append((typ, code, val))
+
+    def process(self, frame):
+        old_tid = [s.axes[ABS_MT_TID] for s in self.slots]
+        changed, other = {}, []
+        for typ, code, val in frame:
+            if typ == EV_ABS and code == ABS_MT_SLOT:
+                self.cur = val if 0 <= val < len(self.slots) else self.cur
+            elif typ == EV_ABS and ABS_MT_FIRST <= code <= ABS_MT_LAST:
+                self.slots[self.cur].axes[code] = val
+                changed.setdefault(self.cur, set()).add(code)
+            elif (typ, code) not in EMULATED:
+                other.append((typ, code, val))
+        out = []
+        for i in sorted(changed):
+            s, old = self.slots[i], old_tid[i]
+            new = s.axes[ABS_MT_TID]
+            ended, started = old >= 0 and new != old, new >= 0 and new != old
+            if ended:
+                if s.button is not None:
+                    self.release(s.button)
+                    s.button = None
+                elif s.active:
+                    out += [(EV_ABS, ABS_MT_SLOT, i), (EV_ABS, ABS_MT_TID, -1)]
+                    s.active = False
+            if started:
+                b = self.match(s.axes.get(ABS_MT_X, 0), s.axes.get(ABS_MT_Y, 0))
+                if DEBUG:
+                    log('contact slot %d id %d x=%d y=%d -> %s' % (i, new, s.axes.get(ABS_MT_X, 0),
+                        s.axes.get(ABS_MT_Y, 0), 'button %d' % (b + 1) if b is not None else 'touch'))
+                if b is not None:
+                    s.button = b
+                    self.press(b)
+                else:
+                    self.seq += 1
+                    s.active, s.seq = True, self.seq
+                    out += [(EV_ABS, ABS_MT_SLOT, i), (EV_ABS, ABS_MT_TID, new)]
+                    out += [(EV_ABS, a, v) for a, v in sorted(s.axes.items()) if a != ABS_MT_TID]
+            elif s.active:
+                out += [(EV_ABS, ABS_MT_SLOT, i)]
+                out += [(EV_ABS, a, s.axes[a]) for a in sorted(changed[i]) if a != ABS_MT_TID]
+        act = [s for s in self.slots if s.active]
+        if int(bool(act)) != self.btn_touch:
+            self.btn_touch = int(bool(act))
+            out.append((EV_KEY, BTN_TOUCH, self.btn_touch))
+        if act and self.has_xy:
+            p = min(act, key=lambda s: s.seq)
+            out += [(EV_ABS, ABS_X, p.axes.get(ABS_MT_X, 0)), (EV_ABS, ABS_Y, p.axes.get(ABS_MT_Y, 0))]
+        self.touch.send(out + other)
+
+    def press(self, b):
+        a = self.actions[b]
+        bl = backlight_state()
+        if self.light:
+            self.light.flash()
+        if DEBUG:
+            log('button %d pressed -> %s (backlight %s)' % (b + 1, a, bl[1] if bl else 'daemon not running'))
+        if a == 'POWER':
+            if not (bl and kill(bl[0], signal.SIGUSR1)):
+                toggle_bl_power()
+            return
+        if bl and kill(bl[0], signal.SIGUSR2):
+            if bl[2]:                      # dark screen: the press only wakes it up
+                self.swallowed.add(b)
+                return
+        if isinstance(a, int):
+            self.kbd.send([(EV_KEY, a, 1)])
+
+    def release(self, b):
+        a = self.actions[b]
+        if DEBUG:
+            log('button %d released' % (b + 1))
+        if b in self.swallowed:
+            self.swallowed.discard(b)
+        elif isinstance(a, int):
+            self.kbd.send([(EV_KEY, a, 0)])
+
+    def close(self):
+        for b in range(len(self.by)):
+            if isinstance(self.actions[b], int):
+                self.kbd.send([(EV_KEY, self.actions[b], 0)])
+        self.touch.close()
+        self.kbd.close()
+
+
+def kill(pid, sig):
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def toggle_bl_power():
+    for p in glob.glob('/sys/class/backlight/*/bl_power'):
+        try:
+            cur = int(open(p).read())
+            with open(p, 'w') as f:
+                f.write('0' if cur else '4')
+        except (OSError, ValueError):
+            pass
+
+
+def run():
+    c = load_conf()
+    os.system('modprobe uinput 2>/dev/null')
+    dev, name = None, None
+    for _ in range(30):                    # the touchscreen driver may still be probing at boot
+        dev, name = find_input(c['TOUCH_NAME'])
+        if dev:
+            break
+        time.sleep(1)
+    if not dev:
+        log('ERROR: no touchscreen with "%s" in its name' % c['TOUCH_NAME'])
+        sys.exit(1)
+    src = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(src, EVIOCGRAB, 1)
+    except OSError as e:
+        log('ERROR: cannot grab %s (%s) - another program holds it. Open by:' % (dev, e))
+        for fd_dir in glob.glob('/proc/[0-9]*/fd'):
+            pid = fd_dir.split('/')[2]
+            try:
+                if any(os.readlink(os.path.join(fd_dir, f)) == dev for f in os.listdir(fd_dir)) and int(pid) != os.getpid():
+                    log('  pid %s: %s' % (pid, open('/proc/%s/cmdline' % pid).read().replace('\0', ' ').strip()))
+            except OSError:
+                pass
+        sys.exit(1)
+    absinfo, cur_slot = {}, 0
+    for a in bits(src, EVIOCGBIT(EV_ABS, 8), 8):
+        buf = bytearray(24)
+        fcntl.ioctl(src, EVIOCGABS(a), buf)
+        val, lo, hi, fuzz, flat, _ = struct.unpack('6i', buf)
+        absinfo[a] = (lo, hi, fuzz, flat)
+        if a == ABS_MT_SLOT:
+            cur_slot = val
+    light = None
+    if c['LIGHT'] == 'yes':
+        try:
+            light = ButtonLight(c)
+        except (OSError, ValueError) as e:
+            log('button light disabled: %s' % e)
+    flt = Filter(c, src, absinfo, cur_slot, light)
+    log('%s (%s) -> "TSW-1060 touchscreen" + "TSW-1060 buttons"; buttons x=%s y=%s keys %s'
+        % (dev, name, c['BUTTON_X'], c['BUTTON_Y'], c['KEYS']))
+    if DEBUG:
+        log('abs ranges %s, current slot %d' % (absinfo, cur_slot))
+        log('slots now: %s' % ['x=%s y=%s' % (s.axes.get(ABS_MT_X), s.axes.get(ABS_MT_Y)) for s in flt.slots])
+        log('waiting for touches and button presses (Ctrl+C to stop)')
+
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        while True:
+            wait = 0.5
+            if light and light.flash_end:
+                wait = min(wait, max(0.02, light.flash_end - time.monotonic()))
+            r, _, _ = select.select([src], [], [], wait)
+            if light:
+                bl = backlight_state()
+                light.tick(bl[1] if bl else 'on')
+            if not r:
+                continue
+            try:
+                data = os.read(src, EV_SIZE * 64)
+            except BlockingIOError:
+                continue
+            for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
+                _, _, typ, code, val = struct.unpack_from(EV_FMT, data, i)
+                flt.event(typ, code, val)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        flt.close()
+        if light:
+            light.restore()
+        log('stopped')
+
+
+def main():
+    global DEBUG
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'run'
+    if cmd in ('run', 'debug'):
+        DEBUG = cmd == 'debug'
+        run()
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,3 @@
+# /etc/default/tsw-sound - TSW-1060 sound (systemd EnvironmentFile: no comments after a value)
+# PulseAudio sink volume set at start
+TSW_VOLUME=60%

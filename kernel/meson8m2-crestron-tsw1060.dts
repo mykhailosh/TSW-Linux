@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Crestron TSW-1060 (Jabil "yushan_one", 10") touch panel, Amlogic S812 (Meson8m2).
+ *
+ * Experimental mainline board file. Data taken from the vendor DTB
+ * (stage2 multi-dtb, aml_dt = yushan_one_10inch), the vendor U-Boot
+ * environment and measurements on a running panel.
+ *
+ * Display: mainline has no LVDS/VPU driver for Meson8. The vendor U-Boot
+ * powers up the 1280x800 LVDS panel and scans out a 24 bpp buffer at
+ * 0x07900000 (display_layer=osd2, display_bpp=24, fb_addr). We keep that
+ * buffer as a simple-framebuffer; boot with clk_ignore_unused pd_ignore_unused.
+ */
+
+/dts-v1/;
+
+#include "meson8m2.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/sound/meson-aiu.h>
+
+/ {
+	model = "Crestron TSW-1060";
+	compatible = "crestron,tsw-1060", "amlogic,meson8m2";
+
+	aliases {
+		ethernet0 = &ethmac;
+		i2c0 = &i2c_AO;
+		i2c1 = &i2c_A;
+		i2c2 = &i2c_B;
+		serial0 = &uart_AO;
+		mmc0 = &sd_card_slot;
+		mmc1 = &sdhc;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		stdout-path = "serial0:115200n8";
+
+		/*
+		 * The vendor U-Boot rewrites /memory to 0..2 GiB, but the first
+		 * 2 MiB are firmware (vendor kernel: phys_offset 0x200000). This
+		 * makes the zImage decompressor and the kernel start at 2 MiB.
+		 */
+		linux,usable-memory-range = <0x00200000 0x7fe00000>;
+
+		framebuffer@7900000 {
+			compatible = "simple-framebuffer";
+			reg = <0x07900000 (1280 * 800 * 3)>;
+			width = <1280>;
+			height = <800>;
+			stride = <(1280 * 3)>;
+			format = "r8g8b8";
+			status = "okay";
+		};
+	};
+
+	/* 2 GiB DDR at 0 (vendor: bootm_low=0, bootm_size=0x80000000) */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x80000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* vendor ramoops (ramoops.mem_address=0x04e00000) - keep untouched */
+		ramoops@4e00000 {
+			reg = <0x04e00000 0x100000>;
+			no-map;
+		};
+
+		/* U-Boot boot logo / panel scan-out buffer (OSD2) */
+		framebuffer@7900000 {
+			reg = <0x07900000 0x400000>;
+			no-map;
+		};
+	};
+
+	usb0_vbus: regulator-usb0-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "USB0_VBUS";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio GPIOX_18 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	gpio-keys-polled {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+
+		key-power {
+			label = "Power";
+			linux,code = <KEY_POWER>;
+			gpios = <&gpio_ao GPIOAO_3 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Speaker path: AIU I2S (GPIOAO_8..11) -> Microsemi ZL38051 DSP (no
+	 * mainline driver; assumed to boot its own firmware/config from its
+	 * flash and pass audio through) -> 2x NXP TFA9890 (DSP bypass).
+	 */
+	sound {
+		compatible = "amlogic,gx-sound-card";
+		model = "TSW-1060";
+
+		assigned-clocks = <&clkc CLKID_MPLL0>,
+				  <&clkc CLKID_MPLL1>,
+				  <&clkc CLKID_MPLL2>;
+		assigned-clock-rates = <270950400>,
+				       <294912000>,
+				       <393216000>;
+
+		dai-link-0 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_FIFO>;
+		};
+
+		dai-link-1 {
+			sound-dai = <&aiu AIU_CPU CPU_I2S_ENCODER>;
+			dai-format = "i2s";
+			mclk-fs = <256>;
+
+			codec-0 {
+				sound-dai = <&speaker_left>;
+			};
+
+			codec-1 {
+				sound-dai = <&speaker_right>;
+			};
+		};
+	};
+
+	vcc_3v3: regulator-vcc3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC3V3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+	};
+
+	vcc_1v8: regulator-vcc1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC1V8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+	};
+};
+
+&aiu {
+	status = "okay";
+	pinctrl-0 = <&i2s_am_clk_pins>, <&i2s_out_ao_clk_pins>,
+		    <&i2s_out_lr_clk_pins>, <&i2s_out_ch01_ao_pins>;
+	pinctrl-names = "default";
+};
+
+&cpu0 {
+	cpu-supply = <&vcck>;
+};
+
+/* Android/Crestron limited the CPU to 1.608 GHz */
+&cpu_opp_table {
+	/delete-node/ opp-1800000000;
+	/delete-node/ opp-1992000000;
+};
+
+&ethmac {
+	status = "okay";
+
+	pinctrl-0 = <&eth_rmii_tsw_pins>;
+	pinctrl-names = "default";
+
+	/* RMII, external SMSC LAN87xx PHY (id 0x0007c0f1), address probed */
+	phy-mode = "rmii";
+
+	/* no local-mac-address: the same DTB is on every panel, tsw-mac sets the address */
+};
+
+&i2c_AO {
+	status = "okay";
+	pinctrl-0 = <&i2c_ao_pins>;
+	pinctrl-names = "default";
+	clock-frequency = <100000>;
+
+	/*
+	 * Same PMIC as MXIII-Plus. Only VCCK (cpufreq) and VDD_EE (Mali) get
+	 * voltage constraints; all other rails keep what U-Boot programmed
+	 * (U-Boot lowers DCDC3/VDD_DDR to 1.35 V after init - do not touch it).
+	 */
+	pmic@32 {
+		compatible = "ricoh,rn5t618";
+		reg = <0x32>;
+		system-power-controller;
+
+		regulators {
+			vcck: DCDC1 {
+				regulator-name = "VCCK";
+				regulator-min-microvolt = <825000>;
+				regulator-max-microvolt = <1150000>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			vddee: DCDC2 {
+				regulator-name = "VDD_EE";
+				regulator-min-microvolt = <1150000>;
+				regulator-max-microvolt = <1150000>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			DCDC3 {
+				regulator-name = "VDD_DDR";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDO1 {
+				regulator-name = "VDDIO_AO28";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			vddio_ao1v8: LDO2 {
+				regulator-name = "VDDIO_AO18";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDO3 {
+				regulator-name = "LDO3_1V8";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDO4 {
+				regulator-name = "LDO4_2V85";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDO5 {
+				regulator-name = "LDO5_1V8";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDORTC1 {
+				regulator-name = "VDD_LDO";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+
+			LDORTC2 {
+				regulator-name = "RTC_0V9";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+		};
+	};
+};
+
+/*
+ * i2c-A: 2x NXP TFA9890 speaker amplifiers (0x34 left, 0x36 right, tfa989x DSP bypass),
+ * 0x45 probably ZL38051 DSP, 0x4a MAX44009 ambient light sensor, 0x0e unknown.
+ */
+&i2c_A {
+	status = "okay";
+	pinctrl-0 = <&i2c_a_tsw_pins>;
+	pinctrl-names = "default";
+	clock-frequency = <100000>;
+
+	speaker_left: audio-codec@34 {
+		compatible = "nxp,tfa9890";
+		reg = <0x34>;
+		sound-name-prefix = "Speaker Left";
+		#sound-dai-cells = <0>;
+	};
+
+	speaker_right: audio-codec@36 {
+		compatible = "nxp,tfa9890";
+		reg = <0x36>;
+		sound-name-prefix = "Speaker Right";
+		#sound-dai-cells = <0>;
+	};
+
+	light-sensor@4a {
+		compatible = "maxim,max44009";
+		reg = <0x4a>;
+	};
+};
+
+/* i2c-B: touch FT5x06 (0x38), backlight MP3309C (0x17) */
+&i2c_B {
+	status = "okay";
+	pinctrl-0 = <&i2c_b_tsw_pins>;
+	pinctrl-names = "default";
+	clock-frequency = <100000>;
+
+	/*
+	 * LCD backlight: MPS MP3309C, brightness over I2C (5 bit, 0..31).
+	 * U-Boot leaves level 12, reg1 = 0x28 (sync mode, OVP 35.5 V) - the
+	 * same values the driver writes, so no flicker. The chip enable is
+	 * driven by U-Boot through PWM_C on GPIODV_29 (PERIPHS_PIN_MUX_3 bit 25)
+	 * and must be left alone: no enable-gpios here (the driver is patched
+	 * to make it optional). GPIODV_28, named as backlight enable in the
+	 * vendor DTB, switches the backlight OFF when driven high on this
+	 * panel (tested 30.10.2026). The vendor kernel used levels 1..23 only;
+	 * userspace (tsw-backlight) keeps to that range.
+	 */
+	backlight: backlight@17 {
+		compatible = "mps,mp3309c";
+		reg = <0x17>;
+		default-brightness = <12>;
+		mps,overvoltage-protection-microvolt = <35500000>;
+	};
+
+	touchscreen@38 {
+		compatible = "edt,edt-ft5506";
+		reg = <0x38>;
+		interrupt-parent = <&gpio_intc>;
+		interrupts = <133 IRQ_TYPE_EDGE_FALLING>;	/* GPIOX_21 */
+		/*
+		 * No reset-gpios: the vendor DTB names GPIODV_0 as touch reset,
+		 * but on this panel the controller only answers while GPIODV_0 is
+		 * left as an input (as U-Boot leaves it); driving it 0 or 1 makes
+		 * 0x38 disappear (tested with gpioset, 29.10.2026).
+		 */
+		touchscreen-size-x = <1280>;
+		touchscreen-size-y = <800>;
+	};
+};
+
+&mali {
+	mali-supply = <&vddee>;
+};
+
+&pinctrl_cbus {
+	/*
+	 * RMII pins. meson8.dtsi's eth_pins node ("ethernet") is overridden by
+	 * meson8m2.dtsi with the RGMII groups (eth_txd3 = GPIOZ_0 clashes with
+	 * i2c-A), so this board needs its own node.
+	 */
+	eth_rmii_tsw_pins: eth-rmii-tsw {
+		mux {
+			groups = "eth_tx_clk_50m", "eth_tx_en",
+				 "eth_txd1", "eth_txd0",
+				 "eth_rx_clk_in", "eth_rx_dv",
+				 "eth_rxd1", "eth_rxd0", "eth_mdio",
+				 "eth_mdc";
+			function = "ethernet";
+			bias-disable;
+		};
+	};
+
+	i2c_a_tsw_pins: i2c-a-tsw {
+		mux {
+			groups = "i2c_sda_a0", "i2c_sck_a0";
+			function = "i2c_a";
+			bias-disable;
+		};
+	};
+
+	i2c_b_tsw_pins: i2c-b-tsw {
+		mux {
+			groups = "i2c_sda_b", "i2c_sck_b";
+			function = "i2c_b";
+			bias-disable;
+		};
+	};
+
+	sdxc_c_tsw_pins: sdxc-c-tsw {
+		mux {
+			groups = "sdxc_d0_c", "sdxc_d13_c", "sdxc_d47_c",
+				 "sdxc_clk_c", "sdxc_cmd_c";
+			function = "sdxc_c";
+			bias-pull-up;
+		};
+	};
+};
+
+&rtc {
+	status = "okay";
+};
+
+&saradc {
+	status = "okay";
+	vref-supply = <&vddio_ao1v8>;
+};
+
+/* eMMC Hynix H26M31001HPR 4 GB on the SDHC controller (BOOT pins) */
+&sdhc {
+	status = "okay";
+
+	pinctrl-0 = <&sdxc_c_tsw_pins>;
+	pinctrl-names = "default";
+
+	bus-width = <8>;
+	max-frequency = <50000000>;
+
+	disable-wp;
+	non-removable;
+	cap-mmc-highspeed;
+	no-sd;
+	no-sdio;
+
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_1v8>;
+};
+
+&sdio {
+	status = "okay";
+
+	pinctrl-0 = <&sd_b_pins>;
+	pinctrl-names = "default";
+
+	/* microSD: root file system lives here, so do not rely on card detect */
+	sd_card_slot: slot@1 {
+		compatible = "mmc-slot";
+		reg = <1>;
+		status = "okay";
+
+		bus-width = <4>;
+		no-sdio;
+		cap-mmc-highspeed;
+		cap-sd-highspeed;
+		disable-wp;
+		non-removable;
+
+		vmmc-supply = <&vcc_3v3>;
+	};
+};
+
+&uart_AO {
+	status = "okay";
+	pinctrl-0 = <&uart_ao_a_pins>;
+	pinctrl-names = "default";
+};
+
+/* USB host port */
+/*
+ * usb0 (OTG core, used as host): the built-in UVC camera (Android used MJPEG
+ * preview, ro.camera.preview.UseMJPEG=1). The vendor DTB powers this port's
+ * VBUS with GPIOX_18 (usb_a: gpio-vbus-power = "GPIOX_18").
+ */
+&usb0 {
+	status = "okay";
+	vbus-supply = <&usb0_vbus>;
+};
+
+&usb0_phy {
+	status = "okay";
+};
+
+&usb1 {
+	status = "okay";
+};
+
+&usb1_phy {
+	status = "okay";
+};
