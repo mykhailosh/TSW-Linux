@@ -10,7 +10,8 @@
 #   2. Debian 12 root filesystem (systemd, OpenSSH, DHCP on eth0, ntpdate);
 #   3. sound: system-wide PulseAudio (the device never suspends, so the I2S clock never stops),
 #      JTAG off on the I2S lines, TFA9890 amplifiers in DSP mode with the Jabil profile;
-#      backlight (tsw-backlight), side buttons (tsw-buttons), microphone (snd-tsw-audin module);
+#      backlight (tsw-backlight), side buttons (tsw-buttons), microphone (snd-tsw-audin module),
+#      camera (ov5640 and meson8-csi2 modules, v4l-utils);
 #   4. image: the first 80 MiB (U-Boot copy, environment, FAT) from the original card image,
 #      kernel/DTB in FAT, U-Boot environment (boots the new kernel via preboot).
 #
@@ -39,6 +40,7 @@
 #   * Backlight: U-Boot leaves the MP3309C enable on -> patch 0002 in the kernel, node without enable-gpios.
 #   * Buttons: tsw-buttons grabs the touch device (EVIOCGRAB) and provides virtual devices (uinput).
 #   * Microphone: mainline has no AUDIN driver -> the mic/snd-tsw-audin.c module is built here too.
+#   * Camera: mainline has no CSI-2 receiver for Meson8 -> kernel patches 0003-0006 (not yet tested on a panel).
 #   * All service messages in the image are in English.
 # =============================================================================
 set -euo pipefail
@@ -80,7 +82,7 @@ BOOT_MAINLINE="mmcinfo;fatload mmc 0 $KADDR UIMAGE.TSW;fatload mmc 0 $DADDR TSW1
 
 PACKAGES="systemd,systemd-sysv,dbus,ifupdown,isc-dhcp-client,\
 openssh-server,sudo,iproute2,iputils-ping,procps,psmisc,nano,vim,less,kmod,netbase,ca-certificates,wget,\
-libubootenv-tool,ntpsec-ntpdate,i2c-tools,gpiod,evtest,e2fsprogs,dosfstools,python3,alsa-utils,flac,usbutils"
+libubootenv-tool,ntpsec-ntpdate,i2c-tools,gpiod,evtest,e2fsprogs,dosfstools,python3,alsa-utils,flac,usbutils,v4l-utils"
 CHROOT_PACKAGES="udev pulseaudio pulseaudio-utils libasound2-plugins"
 
 log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }

@@ -9,12 +9,13 @@ from the card, so going back only takes inserting the original card.
 | Part | How it works |
 |---|---|
 | System | Debian 12 armhf, systemd, OpenSSH, DHCP on `eth0` |
-| Kernel | 6.12.114 + the board description and 2 patches from `kernel/` |
+| Kernel | 6.12.114 + the board description and 6 patches from `kernel/` |
 | Display | simpledrm on the U-Boot framebuffer, 1280×800, console on screen |
 | Touch | FT5822, `edt-ft5x06` driver built into the kernel, multitouch |
 | Side buttons | `tsw-buttons`: they are keys of the same controller; provides a virtual touchscreen and keyboard |
 | Sound | AIU I2S → ZL38051 → 2× TFA9890 with the Jabil profile, system-wide PulseAudio |
 | Microphone | `snd-tsw-audin` module (card `TSW1060Mic`); no PulseAudio source yet, the gain is not tuned |
+| Camera | OV5640 on MIPI CSI-2, `ov5640` and `meson8-csi2` modules, capture to memory in UYVY; **not yet tested on a panel** |
 | Backlight | `tsw-backlight`: auto brightness, dim and off when idle |
 | Network | random MAC per card: created on the first boot, kept in `/etc/default/tsw-mac` |
 | USB | keyboards, mice and other USB devices work when connected (verified) |
@@ -133,6 +134,10 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
   device open. Microphone capture also takes its clock from playback.
 - **48 kHz only:** ZL38051 and TFA9890 run at this rate, everything is converted to it.
 - **Sound card order:** playback is `card 0` (`hw:0,0` in PulseAudio), the microphone is always `card 1`.
+- **Camera:** the OV5640 is on I2C_D (`i2c-3`, address 0x3c) and has no privacy shutter. The receiver
+  registers sit on the VPU bus, which stays on from U-Boot because of `clk_ignore_unused pd_ignore_unused`.
+  The camera driver, clocks and sensor tuning come from
+  [tsx-mainline/linux](https://github.com/tsx-mainline/linux), adapted to 6.12.
 - **Service messages** are in English only.
 
 ## Checks after boot
@@ -150,3 +155,28 @@ tsw-mic-check
 ```
 
 Expect `tsw-tfa: 0x34: cold start in 0.33 s`. If there is no sound, look at `cat /proc/asound/cards`.
+
+Camera: find the capture device, then set the same format on the sensor, the receiver and the video device.
+The commands assume `/dev/media0` and `/dev/video0`.
+
+```bash
+media-ctl -p
+```
+
+```bash
+media-ctl -d /dev/media0 -V '"ov5640 3-003c":0 [fmt:UYVY8_1X16/1280x720]'
+```
+
+```bash
+media-ctl -d /dev/media0 -V '"meson8-csi2":0 [fmt:UYVY8_1X16/1280x720]'
+```
+
+```bash
+v4l2-ctl -d /dev/video0 --set-fmt-video=width=1280,height=720,pixelformat=UYVY
+```
+
+```bash
+v4l2-ctl -d /dev/video0 --stream-mmap=4 --stream-count=30 --stream-to=frames.uyvy
+```
+
+Expect `ISP tuning for crestron,tsw-1060` in `dmesg | grep ov5640`. Without it the picture has a magenta cast.
