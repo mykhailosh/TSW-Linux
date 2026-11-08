@@ -125,6 +125,7 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
 | `buttons/` | `tsw-buttons` | `sh install.sh` |
 | `mic/` | `snd-tsw-audin` driver, `tsw-mic-check` | `make WORK=<build folder>`, then `sh install.sh` |
 | `net/` | `tsw-mac` | `sh install.sh` |
+| `camera/` | `tsw-cam-diag.py`: clocks, receiver and sensor registers during a capture | copy, run as root |
 
 ## Hardware notes
 

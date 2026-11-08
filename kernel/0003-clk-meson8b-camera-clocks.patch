@@ -7,7 +7,7 @@ diff --git a/drivers/clk/meson/meson8b.c b/drivers/clk/meson/meson8b.c
 index b7417ac..19d84fb 100644
 --- a/drivers/clk/meson/meson8b.c
 +++ b/drivers/clk/meson/meson8b.c
-@@ -2682,6 +2682,128 @@ static struct clk_regmap meson8b_cts_i958 = {
+@@ -2682,6 +2682,147 @@ static struct clk_regmap meson8b_cts_i958 = {
  	},
  };
  
@@ -83,6 +83,25 @@ index b7417ac..19d84fb 100644
 + */
 +static u32 meson8_mipi_phy_mux_table[] = { 1 };
 +
++/*
++ * The clock framework never sets the parent of a mux with one parent, and
++ * the register keeps source 0 (no clock) from boot. The first D-PHY register
++ * access of a capture then hangs. Select the source at registration.
++ */
++static int meson8_mipi_phy_sel_init(struct clk_hw *hw)
++{
++	struct clk_regmap *clk = to_clk_regmap(hw);
++	struct clk_regmap_mux_data *mux = clk_get_regmap_mux_data(clk);
++
++	return regmap_update_bits(clk->map, mux->offset,
++				  mux->mask << mux->shift,
++				  mux->table[0] << mux->shift);
++}
++
++static const struct clk_ops meson8_mipi_phy_sel_ops = {
++	.init = meson8_mipi_phy_sel_init,
++};
++
 +static struct clk_regmap meson8_mipi_phy_sel = {
 +	.data = &(struct clk_regmap_mux_data) {
 +		.offset = HHI_MIPI_PHY_CLK_CNTL,
@@ -92,7 +111,7 @@ index b7417ac..19d84fb 100644
 +	},
 +	.hw.init = &(struct clk_init_data) {
 +		.name = "mipi_phy_sel",
-+		.ops = &clk_regmap_mux_ops,
++		.ops = &meson8_mipi_phy_sel_ops,
 +		.parent_hws = (const struct clk_hw *[]) {
 +			&meson8b_fclk_div3.hw
 +		},
@@ -136,7 +155,7 @@ index b7417ac..19d84fb 100644
  #define MESON_GATE(_name, _reg, _bit) \
  	MESON_PCLK(_name, _reg, _bit, &meson8b_clk81.hw)
  
-@@ -2713,6 +2835,7 @@ static MESON_GATE(meson8b_demux, HHI_GCLK_MPEG1, 4);
+@@ -2713,6 +2854,7 @@ static MESON_GATE(meson8b_demux, HHI_GCLK_MPEG1, 4);
  static MESON_GATE(meson8b_blkmv, HHI_GCLK_MPEG1, 14);
  static MESON_GATE(meson8b_aiu, HHI_GCLK_MPEG1, 15);
  static MESON_GATE(meson8b_uart1, HHI_GCLK_MPEG1, 16);
@@ -144,7 +163,7 @@ index b7417ac..19d84fb 100644
  static MESON_GATE(meson8b_g2d, HHI_GCLK_MPEG1, 20);
  static MESON_GATE(meson8b_usb0, HHI_GCLK_MPEG1, 21);
  static MESON_GATE(meson8b_usb1, HHI_GCLK_MPEG1, 22);
-@@ -2978,6 +3101,13 @@ static struct clk_hw *meson8_hw_clks[] = {
+@@ -2978,6 +3120,13 @@ static struct clk_hw *meson8_hw_clks[] = {
  	[CLKID_CTS_I958]	    = &meson8b_cts_i958.hw,
  	[CLKID_VID_PLL_LVDS_EN]	    = &meson8b_vid_pll_lvds_en.hw,
  	[CLKID_HDMI_PLL_DCO_IN]	    = &hdmi_pll_dco_in.hw,
@@ -158,7 +177,7 @@ index b7417ac..19d84fb 100644
  };
  
  static struct clk_hw *meson8b_hw_clks[] = {
-@@ -3410,6 +3540,13 @@ static struct clk_hw *meson8m2_hw_clks[] = {
+@@ -3410,6 +3559,13 @@ static struct clk_hw *meson8m2_hw_clks[] = {
  	[CLKID_CTS_I958]	    = &meson8b_cts_i958.hw,
  	[CLKID_VID_PLL_LVDS_EN]	    = &meson8b_vid_pll_lvds_en.hw,
  	[CLKID_HDMI_PLL_DCO_IN]	    = &hdmi_pll_dco_in.hw,
@@ -172,7 +191,7 @@ index b7417ac..19d84fb 100644
  };
  
  static struct clk_regmap *const meson8b_clk_regmaps[] = {
-@@ -3606,6 +3743,13 @@ static struct clk_regmap *const meson8b_clk_regmaps[] = {
+@@ -3606,6 +3762,13 @@ static struct clk_regmap *const meson8b_clk_regmaps[] = {
  	&meson8b_cts_mclk_i958,
  	&meson8b_cts_i958,
  	&meson8b_vid_pll_lvds_en,
