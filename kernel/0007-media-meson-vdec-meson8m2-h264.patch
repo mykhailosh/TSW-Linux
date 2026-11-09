@@ -1,0 +1,637 @@
+Subject: media: meson: vdec: add Meson8m2 H.264 decoding
+
+VDEC_1 of the S812 runs the Meson8 H.264 microcode, which speaks the same
+mailbox protocol as the GXBB one. Differences handled here:
+
+- AO power registers through the Meson8 syscon (&pmu, AO + 0xe0), and only
+  the VDEC_1 isolation bits are touched;
+- the VDEC_1 clock is not set by the driver, DT assigns fclk_div4
+  (637.5 MHz): a rate request could move vdec_1_sel to an audio MPLL;
+- H.264 start as in the vendor vh264_prot_init(): VLD reset, PSCALE off,
+  no SEI buffer (AV_SCRATCH_I/J), no AV_SCRATCH_F bit 7; commands 4 and 5
+  (slice groups) are acked quietly;
+- the AMRISC cores are reset before MPSR = 1, as in the vendor amvdec_start();
+- firmware DMA is polled with a 100 ms timeout instead of 1000 reads;
+- Meson8 canvases have no known endianness control, so the canvases are set
+  without a swap and the frames come out as the decoder writes them. Two
+  test parameters pass endianness bits anyway: meson_vdec.meson8_endian and
+  meson_canvas.meson8_endian;
+- meson_canvas_config() errors are no longer ignored for NV12M, and a failed
+  canvas setup aborts the H.264 session;
+- generic fix: if the CAPTURE queue is set up between the firmware's
+  "parameters" interrupt and amvdec_src_change(), changed_format is cleared
+  and STREAMON never resumes the decoder (the firmware waits forever). The
+  CAPTURE STREAMON now also resumes when the allocated buffers fit the
+  stream (same size, enough buffers). Hit with ffmpeg h264_v4l2m2m;
+- generic fix: a new session claims the core with cmpxchg instead of a
+  check and a later assignment. Two sessions starting at once both powered
+  the decoder on; the first to stop powered it off under the other, whose
+  next DOS register access hung the bus (hard lockup with two players);
+- CAPTURE buffers (MMAP) are allocated cacheable (non_coherent_mem):
+  copying a frame out of uncached memory took ffmpeg 28 ms per 720p
+  frame. vb2 syncs the cache at QBUF/DQBUF. CREATE_BUFS without the
+  non-coherent flag on such a queue is refused by vb2.
+
+Firmware: meson/vdec/meson8_h264.bin, built by vdec/make-meson8-h264-fw.py
+from the vendor 3.10 headers.
+
+diff -urN a/drivers/soc/amlogic/meson-canvas.c b/drivers/soc/amlogic/meson-canvas.c
+--- a/drivers/soc/amlogic/meson-canvas.c	2026-11-08 19:30:17.319771200 +0200
++++ b/drivers/soc/amlogic/meson-canvas.c	2026-11-08 19:30:24.738357800 +0200
+@@ -28,6 +28,15 @@
+ 	#define CANVAS_BLKMODE_BIT	24
+ 	#define CANVAS_ENDIAN_BIT	26
+ #define DMC_CAV_LUT_ADDR	0x08
++
++/*
++ * Meson8/8b/8m2: whether bits 26-29 of DATAH swap bytes as on GX is not
++ * known. Allow them for a test with the video decoder.
++ */
++static bool meson8_endian;
++module_param(meson8_endian, bool, 0644);
++MODULE_PARM_DESC(meson8_endian,
++		 "Test: accept endianness bits on SoCs without known support");
+ 	#define CANVAS_LUT_WR_EN	BIT(9)
+ 	#define CANVAS_LUT_RD_EN	BIT(8)
+ 
+@@ -89,7 +98,7 @@
+ {
+ 	unsigned long flags;
+ 
+-	if (endian && !canvas->supports_endianness) {
++	if (endian && !canvas->supports_endianness && !meson8_endian) {
+ 		dev_err(canvas->dev,
+ 			"Endianness is not supported on this SoC\n");
+ 		return -EINVAL;
+diff -urN a/drivers/staging/media/meson/vdec/Kconfig b/drivers/staging/media/meson/vdec/Kconfig
+--- a/drivers/staging/media/meson/vdec/Kconfig	2026-11-08 19:26:03.761547300 +0200
++++ b/drivers/staging/media/meson/vdec/Kconfig	2026-11-08 19:26:34.480075200 +0200
+@@ -9,3 +9,5 @@
+ 	select MESON_CANVAS
+ 	help
+ 	Support for the video decoder found in gxbb/gxl/gxm chips.
++	On Meson8m2 (S812) only H.264 is supported, with the Meson8
++	microcode in meson/vdec/meson8_h264.bin.
+diff -urN a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+--- a/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-08 19:26:03.782081700 +0200
++++ b/drivers/staging/media/meson/vdec/codec_h264.c	2026-11-08 19:36:25.625609900 +0200
+@@ -163,6 +163,55 @@
+ 		amvdec_write_dos(core, AV_SCRATCH_8, buf_idx + 1);
+ }
+ 
++/*
++ * Meson8 microcode: same mailbox protocol as GXBB, start sequence of the
++ * vendor vh264_prot_init() (3.10). It resets the VLD again after the
++ * memories are powered, has no SEI buffer (AV_SCRATCH_I/J) and no
++ * AV_SCRATCH_F bit 7.
++ */
++static int codec_h264_start_meson8(struct amvdec_session *sess)
++{
++	struct amvdec_core *core = sess->core;
++	struct codec_h264 *h264 = sess->priv;
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		amvdec_write_dos(core, DOS_SW_RESET0,
++				 BIT(7) | BIT(6) | BIT(4));
++		amvdec_write_dos(core, DOS_SW_RESET0, 0);
++		amvdec_read_dos(core, DOS_SW_RESET0);
++		amvdec_read_dos(core, DOS_SW_RESET0);
++		amvdec_read_dos(core, DOS_SW_RESET0);
++	}
++	amvdec_write_dos(core, DOS_SW_RESET0, BIT(9) | BIT(8));
++	amvdec_write_dos(core, DOS_SW_RESET0, 0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++	amvdec_read_dos(core, DOS_SW_RESET0);
++
++	amvdec_write_dos_bits(core, POWER_CTL_VLD, BIT(9) | BIT(6));
++
++	/* Disable PSCALE for hardware sharing */
++	amvdec_write_dos(core, PSCALE_CTRL, 0);
++
++	amvdec_write_dos(core, AV_SCRATCH_0, 0);
++	amvdec_write_dos(core, AV_SCRATCH_1,
++			 h264->workspace_paddr - WORKSPACE_BUF_OFFSET);
++	amvdec_write_dos(core, AV_SCRATCH_G, h264->ext_fw_paddr);
++	amvdec_write_dos(core, AV_SCRATCH_7, 0);
++	amvdec_write_dos(core, AV_SCRATCH_8, 0);
++	amvdec_write_dos(core, AV_SCRATCH_9, 0);
++
++	/* Error recovery mode 1, I/P/B decoding (bit 6 clear) */
++	amvdec_write_dos(core, AV_SCRATCH_F,
++			 (amvdec_read_dos(core, AV_SCRATCH_F) & 0xffffff83) |
++			 BIT(4));
++
++	amvdec_write_dos(core, MDEC_PIC_DC_THRESH, 0x404038aa);
++
++	return 0;
++}
++
+ static int codec_h264_start(struct amvdec_session *sess)
+ {
+ 	u32 workspace_offset;
+@@ -182,6 +231,9 @@
+ 	if (!h264->sei_vaddr)
+ 		return -ENOMEM;
+ 
++	if (vdec_is_meson8(core->platform))
++		return codec_h264_start_meson8(sess);
++
+ 	amvdec_write_dos_bits(core, POWER_CTL_VLD, BIT(9) | BIT(6));
+ 
+ 	workspace_offset = h264->workspace_paddr - WORKSPACE_BUF_OFFSET;
+@@ -288,9 +340,13 @@
+ 	struct codec_h264 *h264 = sess->priv;
+ 	u32 mb_width, mb_height, mb_total;
+ 
+-	amvdec_set_canvases(sess,
+-			    (u32[]){ ANC0_CANVAS_ADDR, 0 },
+-			    (u32[]){ 24, 0 });
++	if (amvdec_set_canvases(sess,
++				(u32[]){ ANC0_CANVAS_ADDR, 0 },
++				(u32[]){ 24, 0 })) {
++		dev_err(core->dev, "Cannot set the frame canvases\n");
++		amvdec_abort(sess);
++		return;
++	}
+ 
+ 	dev_dbg(core->dev, "max_refs = %u; actual_dpb_size = %u\n",
+ 		h264->max_refs, sess->num_dst_bufs);
+@@ -445,6 +501,11 @@
+ 	case 0: /* Unused but not worth printing for */
+ 	case 9:
+ 		break;
++	case 4: /* Meson8: slice group, the vendor driver only acks it */
++	case 5:
++		if (vdec_is_meson8(core->platform))
++			break;
++		fallthrough;
+ 	default:
+ 		dev_info(core->dev, "Unexpected H264 ISR: %08X\n", cmd);
+ 		break;
+@@ -454,7 +515,8 @@
+ 		amvdec_write_dos(core, AV_SCRATCH_0, 0);
+ 
+ 	/* Decoder has some SEI data for us ; ignore */
+-	if (amvdec_read_dos(core, AV_SCRATCH_J) & SEI_DATA_READY)
++	if (!vdec_is_meson8(core->platform) &&
++	    amvdec_read_dos(core, AV_SCRATCH_J) & SEI_DATA_READY)
+ 		amvdec_write_dos(core, AV_SCRATCH_J, 0);
+ 
+ 	return IRQ_HANDLED;
+diff -urN a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-11-08 19:26:03.774084500 +0200
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-11-09 02:42:56.657209700 +0200
+@@ -250,6 +250,16 @@
+ 		}
+ 
+ 		process_num_buffers(q, sess, num_buffers, true);
++		sess->cap_width = sess->width;
++		sess->cap_height = sess->height;
++		/*
++		 * Cached CAPTURE buffers: readers copy whole frames out of
++		 * them (ffmpeg h264_v4l2m2m), and reads of uncached memory
++		 * run at about 50 MB/s on Meson8, i.e. 28 ms per 720p frame.
++		 * vb2 does the cache maintenance at QBUF and DQBUF.
++		 */
++		if (q->memory == VB2_MEMORY_MMAP)
++			q->non_coherent_mem = 1;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -259,6 +269,20 @@
+ 	return 0;
+ }
+ 
++/*
++ * The CAPTURE queue may be set up after the firmware reported the stream
++ * parameters but before amvdec_src_change() ran: it then clears
++ * changed_format although the buffers fit, and nothing would resume the
++ * decoder (seen with ffmpeg on Meson8m2). Resume if the buffers fit.
++ */
++static bool vdec_cap_bufs_fit(struct amvdec_session *sess)
++{
++	return sess->num_dst_bufs &&
++	       sess->cap_width == sess->width &&
++	       sess->cap_height == sess->height &&
++	       sess->num_dst_bufs >= v4l2_ctrl_g_ctrl(sess->ctrl_min_buf_capture);
++}
++
+ static void vdec_vb2_buf_queue(struct vb2_buffer *vb)
+ {
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+@@ -301,7 +325,7 @@
+ 
+ 	if (sess->status == STATUS_NEEDS_RESUME &&
+ 	    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+-	    sess->changed_format) {
++	    (sess->changed_format || vdec_cap_bufs_fit(sess))) {
+ 		codec_ops->resume(sess);
+ 		sess->status = STATUS_RUNNING;
+ 		return 0;
+@@ -312,6 +336,18 @@
+ 	    sess->status == STATUS_INIT)
+ 		return 0;
+ 
++	/*
++	 * A new decoding session: claim the core. Two sessions can get here at
++	 * once (each holds only its own lock): with a plain check both powered
++	 * the decoder on, and the first one to stop powered it off under the
++	 * other, whose next DOS register access hung the bus (seen with two
++	 * players on Meson8m2).
++	 */
++	if (cmpxchg(&core->cur_sess, NULL, sess)) {
++		ret = -EBUSY;
++		goto bufs_done;
++	}
++
+ 	sess->vififo_size = SIZE_VIFIFO;
+ 	sess->vififo_vaddr =
+ 		dma_alloc_coherent(sess->core->dev, sess->vififo_size,
+@@ -319,7 +355,7 @@
+ 	if (!sess->vififo_vaddr) {
+ 		dev_err(sess->core->dev, "Failed to request VIFIFO buffer\n");
+ 		ret = -ENOMEM;
+-		goto bufs_done;
++		goto release_core;
+ 	}
+ 
+ 	sess->should_stop = 0;
+@@ -342,13 +378,14 @@
+ 						   "vdec_recycle");
+ 
+ 	sess->status = STATUS_INIT;
+-	core->cur_sess = sess;
+ 	schedule_work(&sess->esparser_queue_work);
+ 	return 0;
+ 
+ vififo_free:
+ 	dma_free_coherent(sess->core->dev, sess->vififo_size,
+ 			  sess->vififo_vaddr, sess->vififo_paddr);
++release_core:
++	WRITE_ONCE(core->cur_sess, NULL);
+ bufs_done:
+ 	while ((buf = v4l2_m2m_src_buf_remove(sess->m2m_ctx)))
+ 		v4l2_m2m_buf_done(buf, VB2_BUF_STATE_QUEUED);
+@@ -990,6 +1027,8 @@
+ 	  .data = &vdec_platform_g12a },
+ 	{ .compatible = "amlogic,sm1-vdec",
+ 	  .data = &vdec_platform_sm1 },
++	{ .compatible = "amlogic,meson8m2-vdec",
++	  .data = &vdec_platform_meson8m2 },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, vdec_dt_match);
+diff -urN a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-11-08 19:26:03.775081900 +0200
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-11-09 00:43:38.332446000 +0200
+@@ -209,6 +209,8 @@
+  * @keyframe_found: flag set once a keyframe has been parsed
+  * @num_dst_bufs: number of destination buffers
+  * @changed_format: the format changed
++ * @cap_width: width the CAPTURE buffers were allocated for
++ * @cap_height: height the CAPTURE buffers were allocated for
+  * @canvas_alloc: array of all the canvas IDs allocated
+  * @canvas_num: number of canvas IDs allocated
+  * @vififo_vaddr: virtual address for the VIFIFO
+@@ -258,6 +260,8 @@
+ 	unsigned int keyframe_found;
+ 	unsigned int num_dst_bufs;
+ 	unsigned int changed_format;
++	u32 cap_width;
++	u32 cap_height;
+ 
+ 	u8 canvas_alloc[MAX_CANVAS];
+ 	u32 canvas_num;
+diff -urN a/drivers/staging/media/meson/vdec/vdec_1.c b/drivers/staging/media/meson/vdec/vdec_1.c
+--- a/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-08 19:26:03.771088800 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_1.c	2026-11-08 19:28:05.340458800 +0200
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/firmware.h>
+ #include <linux/clk.h>
++#include <linux/iopoll.h>
+ 
+ #include "vdec_1.h"
+ #include "vdec_helpers.h"
+@@ -19,9 +20,51 @@
+ #define AO_RTI_GEN_PWR_ISO0	0xec
+ 	#define GEN_PWR_VDEC_1 (BIT(3) | BIT(2))
+ 	#define GEN_PWR_VDEC_1_SM1 (BIT(1))
++	#define GEN_PWR_VDEC_1_ISO (BIT(7) | BIT(6))
++
++/*
++ * Meson8: the AO syscon (&pmu) starts at AO + 0xe0, so the same registers
++ * sit at 0x08 and 0x0c in it
++ */
++#define MESON8_AO_RTI_GEN_PWR_SLEEP0	0x08
++#define MESON8_AO_RTI_GEN_PWR_ISO0	0x0c
++
++/* Highest VDEC_1 clock of the Meson8m2 vendor kernel is fclk_div4 */
++#define MESON8_VDEC_1_MAX_RATE	640000000
+ 
+ #define MC_SIZE			(4096 * 4)
+ 
++static u32 vdec_1_sleep_reg(struct amvdec_core *core)
++{
++	return vdec_is_meson8(core->platform) ? MESON8_AO_RTI_GEN_PWR_SLEEP0 :
++						AO_RTI_GEN_PWR_SLEEP0;
++}
++
++static void vdec_1_isolate(struct amvdec_core *core, bool isolate)
++{
++	if (core->platform->revision == VDEC_REVISION_SM1)
++		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
++				   GEN_PWR_VDEC_1_SM1,
++				   isolate ? GEN_PWR_VDEC_1_SM1 : 0);
++	else if (vdec_is_meson8(core->platform))
++		/* Only the VDEC_1 bits: HCODEC, VDEC_2 and HEVC share it */
++		regmap_update_bits(core->regmap_ao, MESON8_AO_RTI_GEN_PWR_ISO0,
++				   GEN_PWR_VDEC_1_ISO,
++				   isolate ? GEN_PWR_VDEC_1_ISO : 0);
++	else
++		regmap_write(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
++			     isolate ? 0xc0 : 0);
++}
++
++static void vdec_1_power(struct amvdec_core *core, bool on)
++{
++	u32 mask = core->platform->revision == VDEC_REVISION_SM1 ?
++		   GEN_PWR_VDEC_1_SM1 : GEN_PWR_VDEC_1;
++
++	regmap_update_bits(core->regmap_ao, vdec_1_sleep_reg(core), mask,
++			   on ? 0 : mask);
++}
++
+ static int
+ vdec_1_load_firmware(struct amvdec_session *sess, const char *fwname)
+ {
+@@ -32,7 +75,7 @@
+ 	static void *mc_addr;
+ 	static dma_addr_t mc_addr_map;
+ 	int ret;
+-	u32 i = 1000;
++	u32 val;
+ 
+ 	ret = request_firmware(&fw, fwname, dev);
+ 	if (ret < 0)
+@@ -63,9 +106,9 @@
+ 	amvdec_write_dos(core, IMEM_DMA_COUNT, MC_SIZE / 4);
+ 	amvdec_write_dos(core, IMEM_DMA_CTRL, (0x8000 | (7 << 16)));
+ 
+-	while (--i && amvdec_read_dos(core, IMEM_DMA_CTRL) & 0x8000);
+-
+-	if (i == 0) {
++	ret = readl_poll_timeout(core->dos_base + IMEM_DMA_CTRL, val,
++				 !(val & 0x8000), 10, 100000);
++	if (ret) {
+ 		dev_err(dev, "Firmware load fail (DMA hang?)\n");
+ 		ret = -EINVAL;
+ 		goto free_mc;
+@@ -76,6 +119,10 @@
+ 							fw->data + MC_SIZE,
+ 							fw->size - MC_SIZE);
+ 
++	if (!ret && vdec_is_meson8(core->platform))
++		dev_info(dev, "%s loaded, VDEC_1 at %lu Hz\n", fwname,
++			 clk_get_rate(core->vdec_1_clk));
++
+ free_mc:
+ 	dma_free_coherent(core->dev, MC_SIZE, mc_addr, mc_addr_map);
+ release_firmware:
+@@ -143,20 +190,11 @@
+ 	amvdec_read_dos(core, DOS_SW_RESET0);
+ 
+ 	/* enable vdec1 isolation */
+-	if (core->platform->revision == VDEC_REVISION_SM1)
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
+-				   GEN_PWR_VDEC_1_SM1, GEN_PWR_VDEC_1_SM1);
+-	else
+-		regmap_write(core->regmap_ao, AO_RTI_GEN_PWR_ISO0, 0xc0);
++	vdec_1_isolate(core, true);
+ 	/* power off vdec1 memories */
+ 	amvdec_write_dos(core, DOS_MEM_PD_VDEC, 0xffffffff);
+ 	/* power off vdec1 */
+-	if (core->platform->revision == VDEC_REVISION_SM1)
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+-				   GEN_PWR_VDEC_1_SM1, GEN_PWR_VDEC_1_SM1);
+-	else
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+-				   GEN_PWR_VDEC_1, GEN_PWR_VDEC_1);
++	vdec_1_power(core, false);
+ 
+ 	if (sess->priv)
+ 		codec_ops->stop(sess);
+@@ -179,19 +217,27 @@
+ 	struct amvdec_core *core = sess->core;
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+-	/* Configure the vdec clk to the maximum available */
+-	clk_set_rate(core->vdec_1_clk, 666666666);
++	if (vdec_is_meson8(core->platform)) {
++		/*
++		 * The rate comes from assigned-clock-rates in DT. A rate
++		 * request here could move vdec_1_sel to an MPLL that the
++		 * audio clocks use.
++		 */
++		if (clk_get_rate(core->vdec_1_clk) > MESON8_VDEC_1_MAX_RATE) {
++			dev_err(core->dev, "VDEC_1 clock %lu Hz is too high\n",
++				clk_get_rate(core->vdec_1_clk));
++			return -EINVAL;
++		}
++	} else {
++		/* Configure the vdec clk to the maximum available */
++		clk_set_rate(core->vdec_1_clk, 666666666);
++	}
+ 	ret = clk_prepare_enable(core->vdec_1_clk);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Enable power for VDEC_1 */
+-	if (core->platform->revision == VDEC_REVISION_SM1)
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+-				   GEN_PWR_VDEC_1_SM1, 0);
+-	else
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+-				   GEN_PWR_VDEC_1, 0);
++	vdec_1_power(core, true);
+ 	usleep_range(10, 20);
+ 
+ 	/* Reset VDEC1 */
+@@ -203,11 +249,7 @@
+ 	/* enable VDEC Memories */
+ 	amvdec_write_dos(core, DOS_MEM_PD_VDEC, 0);
+ 	/* Remove VDEC1 Isolation */
+-	if (core->platform->revision == VDEC_REVISION_SM1)
+-		regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
+-				   GEN_PWR_VDEC_1_SM1, 0);
+-	else
+-		regmap_write(core->regmap_ao, AO_RTI_GEN_PWR_ISO0, 0);
++	vdec_1_isolate(core, false);
+ 	/* Reset DOS top registers */
+ 	amvdec_write_dos(core, DOS_VDEC_MCRCC_STALL_CTRL, 0);
+ 
+@@ -234,6 +276,14 @@
+ 	else
+ 		amvdec_clear_dos_bits(core, MDEC_PIC_DC_CTRL, BIT(17));
+ 
++	if (vdec_is_meson8(core->platform)) {
++		/* Reset the AMRISC cores before the start, as vendor does */
++		amvdec_read_dos(core, DOS_SW_RESET0);
++		amvdec_write_dos(core, DOS_SW_RESET0, BIT(12) | BIT(11));
++		amvdec_write_dos(core, DOS_SW_RESET0, 0);
++		amvdec_read_dos(core, DOS_SW_RESET0);
++	}
++
+ 	/* Enable firmware processor */
+ 	amvdec_write_dos(core, MPSR, 1);
+ 	/* Let the firmware settle */
+diff -urN a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-08 19:26:03.772080600 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-11-08 19:30:10.914046600 +0200
+@@ -14,6 +14,27 @@
+ #define NUM_CANVAS_NV12 2
+ #define NUM_CANVAS_YUV420 3
+ 
++/*
++ * GX canvases swap the 64-bit words the DOS writes (ENDIAN_SWAP64), so the
++ * frames are NV12 in memory. The Meson8 canvas driver has no endianness
++ * control, so Meson8 frames come out as the decoder writes them. For a test,
++ * meson8_endian is passed to the canvas (needs meson_canvas.meson8_endian=1).
++ * The frames cannot be swapped in place: they stay references after they
++ * are done.
++ */
++static uint meson8_endian;
++module_param(meson8_endian, uint, 0644);
++MODULE_PARM_DESC(meson8_endian,
++		 "Meson8 test: canvas endianness bits (0 none, 7 swap64)");
++
++static unsigned int amvdec_canvas_endian(struct amvdec_core *core)
++{
++	if (vdec_is_meson8(core->platform))
++		return meson8_endian & 0xf;
++
++	return MESON_CANVAS_ENDIAN_SWAP64;
++}
++
+ u32 amvdec_read_dos(struct amvdec_core *core, u32 reg)
+ {
+ 	return readl_relaxed(core->dos_base + reg);
+@@ -116,19 +137,19 @@
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+ 			    width, height, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    amvdec_canvas_endian(core));
+ 
+ 	/* U plane */
+ 	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+ 			    width / 2, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    amvdec_canvas_endian(core));
+ 
+ 	/* V plane */
+ 	meson_canvas_config(core->canvas, canvas_id[2], buf_paddr[2],
+ 			    width / 2, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++			    amvdec_canvas_endian(core));
+ 
+ 	amvdec_write_dos(core, reg,
+ 			 ((canvas_id[2]) << 16) |
+@@ -157,16 +178,20 @@
+ 	}
+ 
+ 	/* Y plane */
+-	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+-			    width, height, MESON_CANVAS_WRAP_NONE,
+-			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++	ret = meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
++				  width, height, MESON_CANVAS_WRAP_NONE,
++				  MESON_CANVAS_BLKMODE_LINEAR,
++				  amvdec_canvas_endian(core));
++	if (ret)
++		return ret;
+ 
+ 	/* U/V plane */
+-	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+-			    width, height / 2, MESON_CANVAS_WRAP_NONE,
+-			    MESON_CANVAS_BLKMODE_LINEAR,
+-			    MESON_CANVAS_ENDIAN_SWAP64);
++	ret = meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
++				  width, height / 2, MESON_CANVAS_WRAP_NONE,
++				  MESON_CANVAS_BLKMODE_LINEAR,
++				  amvdec_canvas_endian(core));
++	if (ret)
++		return ret;
+ 
+ 	amvdec_write_dos(core, reg,
+ 			 ((canvas_id[1]) << 16) |
+diff -urN a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c	2026-11-08 19:26:03.766066700 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c	2026-11-08 19:26:24.299662200 +0200
+@@ -289,6 +289,32 @@
+ 	},
+ };
+ 
++/*
++ * Meson8m2 (S812): VDEC_1 with the Meson8 H.264 microcode. The canvas has
++ * no endianness control here, see amvdec_canvas_endian().
++ */
++static const struct amvdec_format vdec_formats_meson8m2[] = {
++	{
++		.pixfmt = V4L2_PIX_FMT_H264,
++		.min_buffers = 2,
++		.max_buffers = 24,
++		.max_width = 1920,
++		.max_height = 1080,
++		.vdec_ops = &vdec_1_ops,
++		.codec_ops = &codec_h264_ops,
++		.firmware_path = "meson/vdec/meson8_h264.bin",
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.flags = V4L2_FMT_FLAG_COMPRESSED |
++			 V4L2_FMT_FLAG_DYN_RESOLUTION,
++	},
++};
++
++const struct vdec_platform vdec_platform_meson8m2 = {
++	.formats = vdec_formats_meson8m2,
++	.num_formats = ARRAY_SIZE(vdec_formats_meson8m2),
++	.revision = VDEC_REVISION_MESON8M2,
++};
++
+ const struct vdec_platform vdec_platform_gxbb = {
+ 	.formats = vdec_formats_gxbb,
+ 	.num_formats = ARRAY_SIZE(vdec_formats_gxbb),
+@@ -332,4 +358,5 @@
+ MODULE_FIRMWARE("meson/vdec/gxl_mpeg12.bin");
+ MODULE_FIRMWARE("meson/vdec/gxl_vp9.bin");
+ MODULE_FIRMWARE("meson/vdec/gxm_h264.bin");
++MODULE_FIRMWARE("meson/vdec/meson8_h264.bin");
+ MODULE_FIRMWARE("meson/vdec/sm1_vp9_mmu.bin");
+diff -urN a/drivers/staging/media/meson/vdec/vdec_platform.h b/drivers/staging/media/meson/vdec/vdec_platform.h
+--- a/drivers/staging/media/meson/vdec/vdec_platform.h	2026-11-08 19:26:03.770086100 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_platform.h	2026-11-08 19:26:29.205297300 +0200
+@@ -18,6 +18,7 @@
+ 	VDEC_REVISION_GXM,
+ 	VDEC_REVISION_G12A,
+ 	VDEC_REVISION_SM1,
++	VDEC_REVISION_MESON8M2,
+ };
+ 
+ struct vdec_platform {
+@@ -32,5 +33,11 @@
+ extern const struct vdec_platform vdec_platform_gxlx;
+ extern const struct vdec_platform vdec_platform_g12a;
+ extern const struct vdec_platform vdec_platform_sm1;
++extern const struct vdec_platform vdec_platform_meson8m2;
++
++static inline bool vdec_is_meson8(const struct vdec_platform *platform)
++{
++	return platform->revision == VDEC_REVISION_MESON8M2;
++}
+ 
+ #endif

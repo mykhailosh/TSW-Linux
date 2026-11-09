@@ -8,7 +8,9 @@ tsw-backlight - TSW-1060 backlight daemon (MP3309C via the mainline mp3309c driv
     the applications (the touchscreen is grabbed while the screen sleeps),
   * smooth fades,
   * SIGUSR1 toggles the screen on/off, SIGUSR2 is activity (wakes it up) - sent by tsw-buttons;
-    the current state is published in /run/tsw-backlight.state ("<pid> <on|dim|off> <grab|->").
+    the current state is published in /run/tsw-backlight.state ("<pid> <on|dim|off> <grab|->"),
+  * any byte written to the FIFO /run/tsw-backlight.wake is activity too, for programs that are
+    not root and cannot signal this daemon (tsw-panel).
 
 Settings: /etc/default/tsw-backlight.   Usage: tsw-backlight [run|status|set N]
 `set N` writes a fixed level and exits (useful for testing; the daemon keeps running).
@@ -17,6 +19,7 @@ import fcntl, glob, math, os, select, signal, struct, sys, time
 
 CONF = '/etc/default/tsw-backlight'
 STATE = '/run/tsw-backlight.state'
+WAKE = '/run/tsw-backlight.wake'
 DEFAULTS = {
     'MIN_LEVEL': '2',        # lowest level used by auto brightness (driver: 0..31)
     'MAX_LEVEL': '23',       # highest level (the vendor kernel never went above 23)
@@ -154,6 +157,19 @@ def run():
     signal.signal(signal.SIGUSR1, lambda *_: req.update(toggle=True))
     signal.signal(signal.SIGUSR2, lambda *_: req.update(wake=True))
 
+    def open_wake():
+        try:
+            if os.path.lexists(WAKE):
+                os.unlink(WAKE)
+            os.mkfifo(WAKE)
+            os.chmod(WAKE, 0o622)                # all it can do is keep the screen on
+            return os.open(WAKE, os.O_RDWR | os.O_NONBLOCK)   # O_RDWR: no EOF between writers
+        except OSError as e:
+            log('no wake FIFO: %s' % e)
+            return None
+
+    wfd = open_wake()
+
     def close_touch():
         nonlocal tfd, trank, grabbed
         if tfd is not None:
@@ -234,11 +250,14 @@ def run():
             state = 'off'; bl.fade(0); grab(swallow('off'))
 
         # --- touches ---
-        r = []
-        if tfd is not None:
-            r, _, _ = select.select([tfd], [], [], 0.25)
-        else:
+        fds = [fd for fd in (tfd, wfd) if fd is not None]
+        ready = select.select(fds, [], [], 0.25)[0] if fds else []
+        if not fds:
             time.sleep(0.25)
+        if wfd in ready:
+            os.read(wfd, 64)
+            req['wake'] = True
+        r = [fd for fd in ready if fd == tfd]
         # --- requests from tsw-buttons ---
         if req['toggle'] or req['wake']:
             toggle = req['toggle']

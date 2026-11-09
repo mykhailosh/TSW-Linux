@@ -10,7 +10,8 @@
 #   2. Debian 12 root filesystem (systemd, OpenSSH, DHCP on eth0, ntpdate);
 #   3. sound: system-wide PulseAudio (the device never suspends, so the I2S clock never stops),
 #      JTAG off on the I2S lines, TFA9890 amplifiers in DSP mode with the Jabil profile;
-#      backlight (tsw-backlight), side buttons (tsw-buttons), microphone (snd-tsw-audin module);
+#      backlight (tsw-backlight), side buttons (tsw-buttons), microphone (snd-tsw-audin module),
+#      camera (ov5640 and meson8-csi2 modules, v4l-utils);
 #   4. image: the first 80 MiB (U-Boot copy, environment, FAT) from the original card image,
 #      kernel/DTB in FAT, U-Boot environment (boots the new kernel via preboot).
 #
@@ -24,6 +25,7 @@
 #   DEBIAN_KEYRING=file  Debian keys for debootstrap (Ubuntu 22.04 has no bookworm key: use
 #                      debian-archive-keyring.gpg from the Debian 12 package)
 #   PASSWORD=...       password of root and tsw (default tsw)
+#   VDEC_FW_SRC=dir    vendor H.264 microcode headers (m8/ucode/h264) instead of downloading them
 #
 # Details handled here (all verified on a panel):
 #   * Boot: Crestron U-Boot rewrites bootcmd itself -> ";run boot_mainline" at the end of preboot.
@@ -39,6 +41,10 @@
 #   * Backlight: U-Boot leaves the MP3309C enable on -> patch 0002 in the kernel, node without enable-gpios.
 #   * Buttons: tsw-buttons grabs the touch device (EVIOCGRAB) and provides virtual devices (uinput).
 #   * Microphone: mainline has no AUDIN driver -> the mic/snd-tsw-audin.c module is built here too.
+#   * Camera: mainline has no CSI-2 receiver for Meson8 -> kernel patches 0003-0006 (not yet tested on a panel).
+#   * H.264 decoder: mainline meson-vdec knows only GX -> patch 0007 and meson8_h264.bin.
+#   * Boot logo: U-Boot "prepare" loads LOGO.BMP (logo/logo.bmp) from FAT, else the Crestron logo
+#     from the eMMC logo partition.
 #   * All service messages in the image are in English.
 # =============================================================================
 set -euo pipefail
@@ -52,6 +58,8 @@ BKL="$HERE/backlight"               # backlight
 BTN="$HERE/buttons"                 # side buttons
 MIC="$HERE/mic"                     # microphone
 NET="$HERE/net"                     # MAC address
+VDEC="$HERE/vdec"                   # H.264 decoder microcode and check
+VDEC_FW_SRC="${VDEC_FW_SRC:-}"
 WORK="${WORK:-$(pwd)/tsw-mainline-build}"
 KVER="${KVER:-6.12.114}"
 KERNEL_DIR="${KERNEL_DIR:-}"
@@ -80,7 +88,7 @@ BOOT_MAINLINE="mmcinfo;fatload mmc 0 $KADDR UIMAGE.TSW;fatload mmc 0 $DADDR TSW1
 
 PACKAGES="systemd,systemd-sysv,dbus,ifupdown,isc-dhcp-client,\
 openssh-server,sudo,iproute2,iputils-ping,procps,psmisc,nano,vim,less,kmod,netbase,ca-certificates,wget,\
-libubootenv-tool,ntpsec-ntpdate,i2c-tools,gpiod,evtest,e2fsprogs,dosfstools,python3,alsa-utils,flac,usbutils"
+libubootenv-tool,ntpsec-ntpdate,i2c-tools,gpiod,evtest,e2fsprogs,dosfstools,python3,alsa-utils,flac,usbutils,v4l-utils"
 CHROOT_PACKAGES="udev pulseaudio pulseaudio-utils libasound2-plugins"
 
 log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
@@ -92,6 +100,7 @@ for f in "$KIN/meson8m2-crestron-tsw1060.dts" "$KIN/meson8m2-crestron-tsw1060-tf
   [ -f "$f" ] || die "missing $f (the kernel folder next to this script)"
 done
 [ -f "$MIC/snd-tsw-audin.c" ] || die "missing $MIC/snd-tsw-audin.c (the mic folder next to this script)"
+[ -f "$VDEC/make-meson8-h264-fw.py" ] || die "missing $VDEC/make-meson8-h264-fw.py (the vdec folder next to this script)"
 if [ "$KERNEL_ONLY" != 1 ]; then
   [ -n "$SRC_IMG" ] || die "Usage: sudo $0 <original Crestron SD image> [output image]"
   [ -f "$SRC_IMG" ] || die "original image not found: $SRC_IMG"
@@ -99,7 +108,7 @@ if [ "$KERNEL_ONLY" != 1 ]; then
   [ ! -e "$OUT_IMG" ] || die "$OUT_IMG already exists: delete it or choose another name"
   for f in "$SND"/{tsw-tfa,tsw-tfa-jabil.json,tsw-jtag-off,tsw-sound,tsw-jtag-off.service,tsw-sound.service,tsw-sound.default,system.pa,tsw.conf,client.conf,asound.conf} \
            "$BKL"/{tsw-backlight,tsw-backlight.default,tsw-backlight.service} \
-           "$BTN"/{tsw-buttons,tsw-buttons.default,tsw-buttons.service} "$MIC/tsw-mic-check" \
+           "$BTN"/{tsw-buttons,tsw-buttons.default,tsw-buttons.service} "$MIC/tsw-mic-check" "$VDEC/tsw-vdec-check" \
            "$NET"/{tsw-mac,tsw-mac.service}; do
     [ -f "$f" ] || die "missing $f (the kit folders next to this script)"
   done
@@ -217,7 +226,12 @@ echo 'obj-m := snd-tsw-audin.o' > "$WORK/mic/Kbuild"
 $KM M="$WORK/mic" modules
 $KM M="$WORK/mic" INSTALL_MOD_PATH="$ART/modroot" INSTALL_MOD_STRIP=1 INSTALL_MOD_DIR=extra modules_install >/dev/null
 rm -f "$ART/modroot/lib/modules/$KREL/build" "$ART/modroot/lib/modules/$KREL/source"
-tar -C "$ART/modroot" -czf "$ART/modules-$KREL.tar.gz" lib/modules
+# H.264 decoder microcode (meson-vdec, patch 0007): built from the vendor 3.10 headers,
+# downloaded from GitHub unless VDEC_FW_SRC names a folder with them; goes with the modules
+mkdir -p "$ART/modroot/lib/firmware/meson/vdec"
+if [ -n "$VDEC_FW_SRC" ]; then VDEC_FW_ARGS=(--src "$VDEC_FW_SRC"); else VDEC_FW_ARGS=(--fetch); fi
+python3 "$VDEC/make-meson8-h264-fw.py" "${VDEC_FW_ARGS[@]}" "$ART/modroot/lib/firmware/meson/vdec/meson8_h264.bin"
+tar -C "$ART/modroot" -czf "$ART/modules-$KREL.tar.gz" lib/modules lib/firmware
 cp "$KOUT/.config" "$ART/config-$KREL"
 ls -l "$ART"
 
@@ -357,6 +371,8 @@ install -m 644 "$NET/tsw-mac.service" "$ROOT/etc/systemd/system/"
 # Microphone: see mic/ (no PulseAudio source yet: the ZL38051 gain is not tuned)
 echo snd-tsw-audin > "$ROOT/etc/modules-load.d/tsw-mic.conf"
 install -m 755 "$MIC/tsw-mic-check" "$ROOT/usr/local/bin/tsw-mic-check"
+# H.264 decoder check (the microcode came with the modules archive)
+install -m 755 "$VDEC/tsw-vdec-check" "$ROOT/usr/local/bin/tsw-vdec-check"
 
 cp -L /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
 
@@ -459,6 +475,10 @@ if ! fatput 2>/dev/null; then
   mdel -i "$FAT" ::BOOT.IMG 2>/dev/null || mdel -i "$FAT" ::boot.img 2>/dev/null || true
   fatput || die "could not write the kernel/DTB to FAT"
 fi
+# boot logo: without the file U-Boot keeps showing the Crestron logo
+if [ -f "$HERE/logo/logo.bmp" ]; then
+  mcopy -o -i "$FAT" "$HERE/logo/logo.bmp" ::LOGO.BMP || warn "no room in FAT for the boot logo"
+fi
 mdir -i "$FAT" ::/ | sed 's/^/  /'
 
 # root filesystem
@@ -480,6 +500,17 @@ uenv "$OUT_IMG" set initargs "$INITARGS"
 for kv in fdt_high=0xffffffff boot_retry=0 golden_boot_retry=0 golden=0 bootdelay=3; do
   uenv "$OUT_IMG" set "${kv%%=*}" "${kv#*=}"
 done
+# boot logo from FAT (same command as logo/install.sh); the original prepare is kept in prepare_crestron
+if mdir -i "$FAT" ::LOGO.BMP >/dev/null 2>&1; then
+  LOGO_HEAD='video open; video clear; video dev bl_on;'
+  LOGO_LOAD='mmcinfo;if fatload mmc 0 ${loadaddr_logo} logo.bmp; then bmp display ${loadaddr_logo}; else '
+  PREP="$(uenv "$OUT_IMG" get prepare_crestron)"
+  [ -n "$PREP" ] || { PREP="$(uenv "$OUT_IMG" get prepare)"; uenv "$OUT_IMG" set prepare_crestron "$PREP"; }
+  case "$PREP" in
+    "$LOGO_HEAD"*) uenv "$OUT_IMG" set prepare "$LOGO_HEAD$LOGO_LOAD${PREP#"$LOGO_HEAD"} fi;" ;;
+    *) warn "unexpected U-Boot prepare: the Crestron logo stays" ;;
+  esac
+fi
 echo "  preboot = $(uenv "$OUT_IMG" get preboot | tail -c 60)"
 echo "  initargs = $(uenv "$OUT_IMG" get initargs)"
 
