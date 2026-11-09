@@ -9,13 +9,14 @@ from the card, so going back only takes inserting the original card.
 | Part | How it works |
 |---|---|
 | System | Debian 12 armhf, systemd, OpenSSH, DHCP on `eth0` |
-| Kernel | 6.12.114 + the board description and 6 patches from `kernel/` |
+| Kernel | 6.12.114 + the board description and 7 patches from `kernel/` |
 | Display | simpledrm on the U-Boot framebuffer, 1280×800, console on screen |
 | Touch | FT5822, `edt-ft5x06` driver built into the kernel, multitouch |
 | Side buttons | `tsw-buttons`: they are keys of the same controller; provides a virtual touchscreen and keyboard |
 | Sound | AIU I2S → ZL38051 → 2× TFA9890 with the Jabil profile, system-wide PulseAudio |
 | Microphone | `snd-tsw-audin` module (card `TSW1060Mic`); no PulseAudio source yet, the gain is not tuned |
 | Camera | OV5640 on MIPI CSI-2, `ov5640` and `meson8-csi2` modules, capture to memory in UYVY; **not yet tested on a panel** |
+| Video decoder | hardware H.264 up to 1920×1080, `meson-vdec` module (V4L2 M2M, for `h264_v4l2m2m`), microcode `meson8_h264.bin`; works on the panel (tsw-panel decodes its live video with it) |
 | Backlight | `tsw-backlight`: auto brightness, dim and off when idle |
 | Network | random MAC per card: created on the first boot, kept in `/etc/default/tsw-mac` |
 | USB | keyboards, mice and other USB devices work when connected (verified) |
@@ -108,6 +109,7 @@ Options (environment variables):
 | `DTB_DEFAULT=bypass` | default to the DTB without the amplifier DSP mode (`tfa989x` driver, no profile) |
 | `KERNEL_ONLY=1` | only the kernel, DTBs and modules |
 | `KERNEL_DIR=path` | a ready, clean 6.12.114 tree instead of downloading it |
+| `VDEC_FW_SRC=folder` | H.264 microcode headers (`m8/ucode/h264` of the vendor 3.10 kernel) instead of downloading them |
 | `DEBIAN_KEYRING=file` | Debian keys: Ubuntu 22.04 has no bookworm key, use the file from the Debian 12 `debian-archive-keyring` package |
 | `PASSWORD=...` | password of `root` and `tsw` (default `tsw`, change it) |
 | `SND_VOLUME=60%` | volume at start |
@@ -126,6 +128,7 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
 | `mic/` | `snd-tsw-audin` driver, `tsw-mic-check` | `make WORK=<build folder>`, then `sh install.sh` |
 | `net/` | `tsw-mac` | `sh install.sh` |
 | `camera/` | `tsw-cam-diag.py`: clocks, receiver and sensor registers during a capture | copy, run as root |
+| `vdec/` | `make-meson8-h264-fw.py` (decoder microcode), `tsw-vdec-check` | the build installs the microcode; copy the check, run as root |
 | `logo/` | `logo.bmp` (U-Boot boot logo), `make-logo.py` to make one from a picture | `sh install.sh` (`sh install.sh remove` = Crestron logo) |
 
 ## Hardware notes
@@ -140,6 +143,15 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
   registers sit on the VPU bus, which stays on from U-Boot because of `clk_ignore_unused pd_ignore_unused`.
   The camera driver, clocks and sensor tuning come from
   [tsx-mainline/linux](https://github.com/tsx-mainline/linux), adapted to 6.12.
+- **Video decoder:** mainline `meson-vdec` supports only GX SoCs; patch 0007 adds the Meson8m2 platform.
+  The microcode comes from the GPL headers of the vendor 3.10 kernel
+  ([hardkernel/linux](https://github.com/hardkernel/linux/tree/odroidc-3.10.y/drivers/amlogic/amports/m8/ucode/h264),
+  branch `odroidc-3.10.y`); the build downloads them and writes `/lib/firmware/meson/vdec/meson8_h264.bin`,
+  which also goes into the modules archive. The VDEC clock is fixed in DT at 637.5 MHz. The decoder is
+  `/dev/video1` (the camera keeps `/dev/video0`). **Frames come out with the bytes of every 64-bit word
+  reversed:** Meson8 canvases cannot swap them (checked on the panel), so the program that reads the frame
+  swaps them back (the panel app does it while converting to RGB). The capture buffers are cached (copying a
+  frame out of uncached memory cost ffmpeg 28 ms per 720p frame). The CMA pool is 192 MiB.
 - **Boot logo:** U-Boot's `prepare` loads `LOGO.BMP` from the card's FAT partition (1280×800, 24-bit BMP);
   without the file it shows the Crestron logo from the eMMC `logo` partition, which is never written. The
   original command is kept in `prepare_crestron`. `make-logo.py picture.png` centres a picture on black
@@ -186,3 +198,26 @@ v4l2-ctl -d /dev/video0 --stream-mmap=4 --stream-count=30 --stream-to=frames.uyv
 ```
 
 Expect `ISP tuning for crestron,tsw-1060` in `dmesg | grep ov5640`. Without it the picture has a magenta cast.
+
+Video decoder: `info` shows the module, the clocks and the power registers; `run` encodes a test clip
+(needs `ffmpeg`, not in the image: `apt install ffmpeg`), decodes it in software and with
+`h264_v4l2m2m` and compares every frame. If nothing comes out, it prints the decoder registers (read only
+while the decoder is powered: without the VDEC clock a read hangs the CPU), the V4L2 calls and the ffmpeg
+log. `bench` compares the speed and CPU load of both decoders on a streaming-like clip.
+
+```bash
+tsw-vdec-check info
+```
+
+```bash
+tsw-vdec-check run 1280x720
+```
+
+```bash
+tsw-vdec-check bench 1280x720
+```
+
+Expect `swap64 : 88/90 frames identical`: the bytes of each 64-bit word are reversed, and the last two
+frames come out swapped when the stream is drained at its end (their timestamps are right).
+`... is already open` means another program (often a hung ffmpeg) holds the decoder: the driver allows
+one session.

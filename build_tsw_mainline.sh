@@ -25,6 +25,7 @@
 #   DEBIAN_KEYRING=file  Debian keys for debootstrap (Ubuntu 22.04 has no bookworm key: use
 #                      debian-archive-keyring.gpg from the Debian 12 package)
 #   PASSWORD=...       password of root and tsw (default tsw)
+#   VDEC_FW_SRC=dir    vendor H.264 microcode headers (m8/ucode/h264) instead of downloading them
 #
 # Details handled here (all verified on a panel):
 #   * Boot: Crestron U-Boot rewrites bootcmd itself -> ";run boot_mainline" at the end of preboot.
@@ -41,6 +42,7 @@
 #   * Buttons: tsw-buttons grabs the touch device (EVIOCGRAB) and provides virtual devices (uinput).
 #   * Microphone: mainline has no AUDIN driver -> the mic/snd-tsw-audin.c module is built here too.
 #   * Camera: mainline has no CSI-2 receiver for Meson8 -> kernel patches 0003-0006 (not yet tested on a panel).
+#   * H.264 decoder: mainline meson-vdec knows only GX -> patch 0007 and meson8_h264.bin.
 #   * Boot logo: U-Boot "prepare" loads LOGO.BMP (logo/logo.bmp) from FAT, else the Crestron logo
 #     from the eMMC logo partition.
 #   * All service messages in the image are in English.
@@ -56,6 +58,8 @@ BKL="$HERE/backlight"               # backlight
 BTN="$HERE/buttons"                 # side buttons
 MIC="$HERE/mic"                     # microphone
 NET="$HERE/net"                     # MAC address
+VDEC="$HERE/vdec"                   # H.264 decoder microcode and check
+VDEC_FW_SRC="${VDEC_FW_SRC:-}"
 WORK="${WORK:-$(pwd)/tsw-mainline-build}"
 KVER="${KVER:-6.12.114}"
 KERNEL_DIR="${KERNEL_DIR:-}"
@@ -96,6 +100,7 @@ for f in "$KIN/meson8m2-crestron-tsw1060.dts" "$KIN/meson8m2-crestron-tsw1060-tf
   [ -f "$f" ] || die "missing $f (the kernel folder next to this script)"
 done
 [ -f "$MIC/snd-tsw-audin.c" ] || die "missing $MIC/snd-tsw-audin.c (the mic folder next to this script)"
+[ -f "$VDEC/make-meson8-h264-fw.py" ] || die "missing $VDEC/make-meson8-h264-fw.py (the vdec folder next to this script)"
 if [ "$KERNEL_ONLY" != 1 ]; then
   [ -n "$SRC_IMG" ] || die "Usage: sudo $0 <original Crestron SD image> [output image]"
   [ -f "$SRC_IMG" ] || die "original image not found: $SRC_IMG"
@@ -103,7 +108,7 @@ if [ "$KERNEL_ONLY" != 1 ]; then
   [ ! -e "$OUT_IMG" ] || die "$OUT_IMG already exists: delete it or choose another name"
   for f in "$SND"/{tsw-tfa,tsw-tfa-jabil.json,tsw-jtag-off,tsw-sound,tsw-jtag-off.service,tsw-sound.service,tsw-sound.default,system.pa,tsw.conf,client.conf,asound.conf} \
            "$BKL"/{tsw-backlight,tsw-backlight.default,tsw-backlight.service} \
-           "$BTN"/{tsw-buttons,tsw-buttons.default,tsw-buttons.service} "$MIC/tsw-mic-check" \
+           "$BTN"/{tsw-buttons,tsw-buttons.default,tsw-buttons.service} "$MIC/tsw-mic-check" "$VDEC/tsw-vdec-check" \
            "$NET"/{tsw-mac,tsw-mac.service}; do
     [ -f "$f" ] || die "missing $f (the kit folders next to this script)"
   done
@@ -221,7 +226,12 @@ echo 'obj-m := snd-tsw-audin.o' > "$WORK/mic/Kbuild"
 $KM M="$WORK/mic" modules
 $KM M="$WORK/mic" INSTALL_MOD_PATH="$ART/modroot" INSTALL_MOD_STRIP=1 INSTALL_MOD_DIR=extra modules_install >/dev/null
 rm -f "$ART/modroot/lib/modules/$KREL/build" "$ART/modroot/lib/modules/$KREL/source"
-tar -C "$ART/modroot" -czf "$ART/modules-$KREL.tar.gz" lib/modules
+# H.264 decoder microcode (meson-vdec, patch 0007): built from the vendor 3.10 headers,
+# downloaded from GitHub unless VDEC_FW_SRC names a folder with them; goes with the modules
+mkdir -p "$ART/modroot/lib/firmware/meson/vdec"
+if [ -n "$VDEC_FW_SRC" ]; then VDEC_FW_ARGS=(--src "$VDEC_FW_SRC"); else VDEC_FW_ARGS=(--fetch); fi
+python3 "$VDEC/make-meson8-h264-fw.py" "${VDEC_FW_ARGS[@]}" "$ART/modroot/lib/firmware/meson/vdec/meson8_h264.bin"
+tar -C "$ART/modroot" -czf "$ART/modules-$KREL.tar.gz" lib/modules lib/firmware
 cp "$KOUT/.config" "$ART/config-$KREL"
 ls -l "$ART"
 
@@ -361,6 +371,8 @@ install -m 644 "$NET/tsw-mac.service" "$ROOT/etc/systemd/system/"
 # Microphone: see mic/ (no PulseAudio source yet: the ZL38051 gain is not tuned)
 echo snd-tsw-audin > "$ROOT/etc/modules-load.d/tsw-mic.conf"
 install -m 755 "$MIC/tsw-mic-check" "$ROOT/usr/local/bin/tsw-mic-check"
+# H.264 decoder check (the microcode came with the modules archive)
+install -m 755 "$VDEC/tsw-vdec-check" "$ROOT/usr/local/bin/tsw-vdec-check"
 
 cp -L /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null || true
 

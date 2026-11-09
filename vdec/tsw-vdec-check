@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""tsw-vdec-check: check the hardware H.264 decoder (meson-vdec, VDEC_1) on a TSW-1060.
+
+  tsw-vdec-check info               driver, device, clocks and power registers
+  tsw-vdec-check run [WxH] [N] [plain|canvas-swap]
+                                    encode a test clip (ffmpeg + libx264), decode it in
+                                    software and with h264_v4l2m2m, compare every frame;
+                                    canvas-swap asks the canvas for 64-bit byte swap
+  tsw-vdec-check bench [WxH] [N]    hardware vs software decoding speed and CPU load on a
+                                    streaming-like clip (60 fps, no B-frames, 12 Mbit/s)
+  tsw-vdec-check regs               decoder registers now (only if VDEC_1 is powered)
+  tsw-vdec-check compare HW SW WxH  compare two NV12 files
+
+The decoder registers (DOS, parser) are read only during 'run' while VDEC_1 is powered and
+clocked: without the VDEC clock a read hangs the CPU. If no frames come out, 'run' prints
+snapshots of them, the ffmpeg log (/root/vdec-test/ffmpeg-hw.log) and the V4L2 ioctls.
+Files of 'run' go to /root/vdec-test (/tmp is cleared at boot); 'compare' writes the
+first frame as PGM next to the hardware file.
+"""
+
+import array
+import glob
+import mmap
+import os
+import re
+import struct
+import subprocess
+import sys
+import time
+
+WORK = "/root/vdec-test"
+HHI = 0xc1104000
+REGS = [  # name, physical address (CBUS/AO only, always clocked)
+    ("HHI_GCLK_MPEG0", HHI + 0x140),
+    ("HHI_GCLK_MPEG1", HHI + 0x144),
+    ("HHI_VDEC_CLK_CNTL", HHI + 0x1e0),
+    ("HHI_VDEC3_CLK_CNTL", HHI + 0x1e8),
+    ("AO_RTI_GEN_PWR_SLEEP0", 0xc81000e8),
+    ("AO_RTI_GEN_PWR_ISO0", 0xc81000ec),
+]
+CLKS = ["vdec_1", "vdec_1_1", "vdec_1_1_div", "vdec_1_sel", "fclk_div4", "dos", "dos_parser"]
+VDEC_SRC = ["fclk_div4 637.5", "fclk_div3 850", "fclk_div5 510", "fclk_div7 364"]
+
+
+def sh(cmd, timeout=None):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def read_phys(addr):
+    fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+    try:
+        page = addr & ~0xfff
+        m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ, offset=page)
+        v = struct.unpack_from("<I", m, addr - page)[0]
+        m.close()
+        return v
+    finally:
+        os.close(fd)
+
+
+def find_decoder():
+    for d in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            name = open(d + "/name").read().strip()
+        except OSError:
+            continue
+        if name == "meson-video-decoder":
+            return "/dev/" + os.path.basename(d)
+    return None
+
+
+def info():
+    rc, out = sh("lsmod | grep -E '^meson_vdec|^v4l2_mem2mem'")
+    print("modules:", out.replace("\n", "; ") or "meson_vdec not loaded")
+    dev = find_decoder()
+    print("decoder device:", dev or "none")
+    fw = "/lib/firmware/meson/vdec/meson8_h264.bin"
+    print("firmware:", fw, os.path.getsize(fw) if os.path.exists(fw) else "MISSING")
+    rc, out = sh("dmesg | grep -iE 'vdec|esparser|canvas' | tail -20")
+    print("dmesg:\n  " + (out.replace("\n", "\n  ") or "(nothing)"))
+    print("clocks (debugfs):")
+    for c in CLKS:
+        base = "/sys/kernel/debug/clk/" + c
+        if not os.path.isdir(base):
+            print(f"  {c:14s} (no debugfs entry)")
+            continue
+        vals = []
+        for f in ("clk_rate", "clk_enable_count", "clk_prepare_count"):
+            try:
+                vals.append(open(f"{base}/{f}").read().strip())
+            except OSError:
+                vals.append("?")
+        try:
+            parent = open(base + "/clk_parent").read().strip()
+        except OSError:
+            parent = "-"
+        print(f"  {c:14s} rate {vals[0]:>10s}  enable {vals[1]}  prepare {vals[2]}  parent {parent}")
+    print("registers:")
+    for name, addr in REGS:
+        try:
+            v = read_phys(addr)
+        except OSError as e:
+            print(f"  {name:22s} read failed: {e}")
+            continue
+        extra = ""
+        if name == "HHI_VDEC_CLK_CNTL":
+            src = (v >> 9) & 7
+            extra = (f"  vdec_1: src {src} ({VDEC_SRC[src] if src < 4 else 'mpll'} MHz) "
+                     f"div {(v & 0x7f) + 1} {'on' if v >> 8 & 1 else 'off'}")
+        elif name == "HHI_VDEC3_CLK_CNTL":
+            extra = f"  vdec_1 mux: {'vdec_1_2' if v >> 15 & 1 else 'vdec_1_1'}"
+        elif name == "AO_RTI_GEN_PWR_SLEEP0":
+            extra = f"  VDEC_1 {'off' if v & 0xc else 'on'}"
+        elif name == "AO_RTI_GEN_PWR_ISO0":
+            extra = f"  VDEC_1 {'isolated' if v & 0xc0 else 'not isolated'}"
+        print(f"  {name:22s} 0x{v:08x}{extra}")
+    for p in ("/sys/module/meson_vdec/parameters/meson8_endian",
+              "/sys/module/meson_canvas/parameters/meson8_endian"):
+        if os.path.exists(p):
+            print(f"{p}: {open(p).read().strip()}")
+
+
+def frames(path, size):
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(size)
+            if len(b) < size:
+                return
+            yield b
+
+
+def swap64(b):
+    a = array.array("Q")
+    a.frombytes(b)
+    a.byteswap()
+    return a.tobytes()
+
+
+def sampled_diff(a, b, step=61):
+    sa, sb = a[::step], b[::step]
+    return sum(1 for x, y in zip(sa, sb) if x != y) / max(1, len(sa))
+
+
+def write_pgm(path, data, w, h):
+    with open(path, "wb") as f:
+        f.write(b"P5\n%d %d\n255\n" % (w, h))
+        f.write(data[: w * h])
+
+
+def compare(hw, sw, w, h):
+    size = w * h * 3 // 2
+    if w % 8:
+        print("width must be a multiple of 8 for the swap64 check")
+    hwf = list(frames(hw, size))
+    swf = list(frames(sw, size))
+    print(f"frames: hardware {len(hwf)}, software {len(swf)}")
+    if not hwf:
+        print("RESULT: no hardware frames")
+        return 1
+    out = os.path.dirname(os.path.abspath(hw))
+    write_pgm(os.path.join(out, "hw0-raw.pgm"), hwf[0], w, h)
+    write_pgm(os.path.join(out, "hw0-swap64.pgm"), swap64(hwf[0]), w, h)
+    write_pgm(os.path.join(out, "sw0.pgm"), swf[0] if swf else b"", w, h)
+    best = None
+    for name, conv in (("raw", lambda b: b), ("swap64", swap64)):
+        conv_hw = [conv(b) for b in hwf]
+        for shift in range(0, 4):
+            pairs = list(zip(conv_hw, swf[shift:]))
+            same = sum(1 for a, b in pairs if a == b)
+            if best is None or same > best[2]:
+                best = (name, shift, same, len(pairs))
+        pairs = list(zip(conv_hw, swf))
+        same = sum(1 for a, b in pairs if a == b)
+        diffs = [sampled_diff(a, b) for a, b in pairs[:10]]
+        print(f"{name:7s}: {same}/{len(pairs)} frames identical; differing bytes in the first "
+              f"frames (sampled): " + " ".join(f"{d:.0%}" for d in diffs))
+    name, shift, same, total = best
+    conv = swap64 if name == "swap64" else (lambda b: b)
+    bad = []
+    for i, b in enumerate(hwf):
+        if i + shift >= len(swf):
+            break
+        c = conv(b)
+        if c == swf[i + shift]:
+            continue
+        near = [j - i - shift for j in range(max(0, i + shift - 3), min(len(swf), i + shift + 4))
+                if swf[j] == c]
+        bad.append(f"{i}" + (f"(=sw{near[0]:+d})" if near else f"({sampled_diff(c, swf[i + shift]):.0%})"))
+    if bad:
+        print(f"differing frames as {name} ({len(bad)}; '=sw+1' means equal to the next "
+              f"software frame, else share of differing bytes): " + " ".join(bad[:30]))
+    if same == total and total:
+        print(f"RESULT: all {total} frames identical as {name}" +
+              (f" (software frames shifted by {shift})" if shift else ""))
+        return 0
+    print(f"RESULT: best {same}/{total} identical as {name}, shift {shift}. "
+          f"First frame as PGM: {out}/hw0-raw.pgm, hw0-swap64.pgm, sw0.pgm")
+    return 1
+
+
+DOS = 0xd0050000
+PARSER = 0xc110a580
+DOS_REGS = [
+    ("MPSR", 0x0c04), ("CPSR", 0x0c84), ("MBOX1_IRQ", 0x01d0), ("MBOX1_MASK", 0x01d8),
+    ("POWER_CTL_VLD", 0x3020), ("DOS_GEN_CTRL0", 0xfc08), ("PSCALE_CTRL", 0x2444),
+    ("VIFIFO_START", 0x3100), ("VIFIFO_CURR", 0x3104), ("VIFIFO_END", 0x3108),
+    ("VIFIFO_CONTROL", 0x3110), ("VIFIFO_WP", 0x3114), ("VIFIFO_RP", 0x3118),
+    ("VIFIFO_LEVEL", 0x311c), ("VIFIFO_BUF_CNTL", 0x3120), ("VIFIFO_WRAP", 0x3144),
+] + [(f"AV_SCRATCH_{c}", 0x2700 + 4 * i) for i, c in enumerate("0123456789ABCDEFGHIJ")]
+PARSER_REGS = [
+    ("PARSER_CONTROL", 0x00), ("PARSER_CONFIG", 0x14), ("PARSER_INT_ENABLE", 0x2c),
+    ("PARSER_INT_STATUS", 0x30), ("PARSER_ES_CONTROL", 0x5c), ("PARSER_VIDEO_START", 0x80),
+    ("PARSER_VIDEO_END", 0x84), ("PARSER_VIDEO_WP", 0x88), ("PARSER_VIDEO_HOLE", 0x90),
+]
+MPC_P, MPC_E = 0x0c18, 0x0c20  # AMRISC program counters (pipeline fetch / execute)
+
+
+def vdec_powered():
+    """True only when DOS registers can be read: VDEC_1 power on, not isolated, clocks on."""
+    sleep0 = read_phys(0xc81000e8)
+    iso0 = read_phys(0xc81000ec)
+    vclk = read_phys(HHI + 0x1e0)
+    gclk = read_phys(HHI + 0x140)
+    return not sleep0 & 0xc and not iso0 & 0xc0 and vclk >> 8 & 1 and gclk >> 17 & 1
+
+
+def holders(dev):
+    """Processes that have the decoder device open."""
+    found = []
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd) == dev:
+                pid = fd.split("/")[2]
+                cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode()
+                found.append(f"{pid} {cmd.strip()}")
+        except OSError:
+            continue
+    return sorted(set(found))
+
+
+def snapshot(proc, label):
+    print(f"--- snapshot {label} ---")
+    rc, out = sh("grep -E 'vdec|esparser' /proc/interrupts")
+    print("interrupts:\n  " + (out.replace("\n", "\n  ") or "(no vdec/esparser lines)"))
+    if proc is not None and proc.poll() is not None:
+        print("ffmpeg already exited, registers not read")
+        return
+    if not vdec_powered():
+        print("VDEC_1 is not powered or clocked, DOS registers not read")
+        return
+    vals = [(n, read_phys(PARSER + o)) for n, o in PARSER_REGS]
+    vals += [(n, read_phys(DOS + o)) for n, o in DOS_REGS]
+    for i in range(0, len(vals), 3):
+        print("  " + "  ".join(f"{n:18s} 0x{v:08x}" for n, v in vals[i:i + 3]))
+    pcs = [(read_phys(DOS + MPC_P), read_phys(DOS + MPC_E)) for _ in range(8)]
+    print("  AMRISC PC (fetch/exec): " + " ".join(f"{p:x}/{e:x}" for p, e in pcs))
+
+
+def hw_decode(clip, hw):
+    """Decode with h264_v4l2m2m; if no output appears, show where the pipeline stopped."""
+    log = os.path.join(WORK, "ffmpeg-hw.log")
+    dev = find_decoder()
+    busy = holders(dev)
+    if busy:
+        print(f"{dev} is already open (the driver allows one session), not starting:\n  " +
+              "\n  ".join(busy) + "\nsee 'tsw-vdec-check regs', then kill these processes")
+        return 1
+    dbg = f"/sys/class/video4linux/{os.path.basename(dev)}/dev_debug"
+    try:
+        open(dbg, "w").write("3")  # log every V4L2 ioctl of the decoder to dmesg
+    except OSError:
+        dbg = None
+    if os.path.exists(hw):
+        os.remove(hw)
+    with open(log, "w") as lf:
+        # -debug_ts logs the timestamp the driver gave every frame (showinfo is not used: it
+        # reads the uncached V4L2 buffers byte by byte, ~140 ms per 720p frame); setpts=N with
+        # passthrough then writes every decoded frame in output order, even with bad timestamps
+        proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "debug", "-debug_ts", "-y",
+             "-c:v", "h264_v4l2m2m", "-i", clip, "-vf", "setpts=N", "-vsync", "passthrough",
+             "-f", "rawvideo", "-pix_fmt", "nv12", hw],
+            stdout=lf, stderr=subprocess.STDOUT)
+    t = 0.0
+    shots = {3.0: "after 3 s", 8.0: "after 8 s"}
+    try:
+        while proc.poll() is None and t < 120:
+            if t in shots:
+                snapshot(proc, shots[t])
+            if t >= 15 and (not os.path.exists(hw) or os.path.getsize(hw) == 0):
+                print("no output after 15 s, stopping ffmpeg")
+                break
+            subprocess.run(["sleep", "0.5"])
+            t += 0.5
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if dbg:
+            try:
+                open(dbg, "w").write("0")
+            except OSError:
+                pass
+    print(f"ffmpeg exit code {proc.returncode}; full log {log}; v4l2 lines:")
+    lines = [l.rstrip() for l in open(log, errors="replace")]
+    keep = [l for l in lines if ("v4l2" in l.lower() or "error" in l.lower())
+            and "->" not in l]
+    print("  " + "\n  ".join(keep[-25:] or lines[-20:]))
+    pts = [int(m.group(1)) for m in
+           (re.search(r"decoder -> .*?\b(?:frame_)?pts:(-?\d+)", l) for l in lines) if m]
+    if pts:
+        steps = sorted({b - a for a, b in zip(pts, pts[1:])})
+        print(f"frame timestamps from the driver: {len(pts)} frames, {len(set(pts))} distinct, "
+              f"{'increasing' if all(b > a for a, b in zip(pts, pts[1:])) else 'NOT increasing'}, "
+              f"steps {steps[:6]}; first: {pts[:12]}")
+    else:
+        print("frame timestamps from the driver: no 'decoder ->' lines in the log")
+    dec_t = [float(m.group(1)) for m in
+             (re.search(r"^\[\s*(\d+\.\d+)\].*VIDIOC_(?:STREAMON: type=vid-cap|DQEVENT: type=0x2)", l)
+              for l in sh("dmesg")[1].splitlines()) if m]
+    if len(dec_t) >= 2:
+        print(f"decoding time (capture STREAMON to EOS event): {dec_t[-1] - dec_t[0]:.2f} s")
+    rc, out = sh("dmesg | grep -iE 'match offset|done but|decoder error|abort'")
+    if out:
+        print("driver warnings:\n  " + "\n  ".join(out.splitlines()[-10:]))
+    rc, out = sh("dmesg | grep -E 'video[0-9]+: '")
+    ioctls = [l for l in out.splitlines() if "VIDIOC" in l]
+    counts = {}
+    for l in ioctls:
+        name = l.split("VIDIOC_", 1)[1].split(":")[0].split()[0]
+        counts[name] = counts.get(name, 0) + 1
+    print("v4l2 ioctl counts: " + (" ".join(f"{k}={v}" for k, v in counts.items()) or "(none)"))
+    print("last v4l2 lines (dmesg):\n  " + ("\n  ".join(out.splitlines()[-25:]) or "(nothing)"))
+    return proc.returncode
+
+
+def timed_ffmpeg(args):
+    t0, c0 = time.monotonic(), os.times()
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", *args],
+                       capture_output=True, text=True, timeout=600)
+    t1, c1 = time.monotonic(), os.times()
+    cpu = (c1.children_user - c0.children_user) + (c1.children_system - c0.children_system)
+    return r.returncode, r.stderr.strip(), t1 - t0, cpu
+
+
+def bench(size="1280x720", count="600"):
+    """Streaming-like clip (60 fps, no B-frames, noisy picture, 12 Mbit/s), decoded to the null
+    muxer (no pixel reads). The cost of starting ffmpeg (a 1-frame run) is subtracted."""
+    frames = int(count)
+    os.makedirs(WORK, exist_ok=True)
+    clip = os.path.join(WORK, f"bench-{size}-{frames}.mkv")
+    if not os.path.exists(clip):
+        print(f"encoding {clip} ({frames} frames, 60 fps, no B-frames, 12 Mbit/s); this takes a while")
+        rc, err, wall, cpu = timed_ffmpeg(
+            ["-y", "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=60", "-vf", "noise=alls=12:allf=t",
+             "-frames:v", str(frames), "-c:v", "libx264", "-preset", "ultrafast",
+             "-tune", "zerolatency", "-bf", "0", "-g", "120", "-b:v", "12M", "-maxrate", "12M",
+             "-bufsize", "2M", clip])
+        if rc:
+            print(err)
+            return 1
+    dev = find_decoder()
+    busy = holders(dev) if dev else []
+    if busy:
+        print(f"{dev} is busy: " + "; ".join(busy))
+        return 1
+    for name, args in (("hardware", ["-c:v", "h264_v4l2m2m"]), ("software", [])):
+        rc0, err0, wall0, cpu0 = timed_ffmpeg([*args, "-i", clip, "-frames:v", "1", "-f", "null", "-"])
+        rc, err, wall, cpu = timed_ffmpeg([*args, "-i", clip, "-f", "null", "-"])
+        if rc or rc0:
+            print(f"benchmark {name}: ffmpeg failed: {(err or err0)[:300]}")
+            continue
+        net_wall, net_cpu = max(wall - wall0, 1e-3), max(cpu - cpu0, 0.0)
+        print(f"benchmark {name}: {wall:.2f} s total, {net_wall:.2f} s without startup -> "
+              f"{frames / net_wall:.0f} fps; ffmpeg CPU {net_cpu:.2f} s = "
+              f"{net_cpu / net_wall:.0%} of one core while decoding "
+              f"({net_cpu / frames * 1000:.1f} ms per frame)")
+    return 0
+
+
+ENDIAN_PARAMS = ["/sys/module/meson_canvas/parameters/meson8_endian",
+                 "/sys/module/meson_vdec/parameters/meson8_endian"]
+
+
+def set_endian_test(on):
+    """Ask the canvas for MESON_CANVAS_ENDIAN_SWAP64 on Meson8 (bits not documented there)."""
+    for p, v in zip(ENDIAN_PARAMS, ("Y", "7") if on else ("N", "0")):
+        with open(p, "w") as f:
+            f.write(v)
+
+
+def run(size="1280x720", count="90", mode="plain"):
+    if mode not in ("plain", "canvas-swap"):
+        print("mode is 'plain' or 'canvas-swap'")
+        return 2
+    w, h = (int(x) for x in size.split("x"))
+    os.makedirs(WORK, exist_ok=True)
+    # a container keeps the packet timestamps (a raw .h264 has none, every frame would get 0)
+    clip = os.path.join(WORK, f"test-{size}.mkv")
+    hw = os.path.join(WORK, f"hw-{size}-{mode}.nv12")
+    sw = os.path.join(WORK, f"sw-{size}.nv12")
+    if not find_decoder():
+        print("no decoder device: modprobe meson_vdec, then see 'tsw-vdec-check info'")
+        return 1
+    if not os.path.exists(clip):
+        print(f"encoding {clip} ({count} frames, High profile, B-frames)")
+        rc, out = sh(f"ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size={size}:rate=30 "
+                     f"-frames:v {count} -c:v libx264 -profile:v high -pix_fmt yuv420p "
+                     f"-g 30 -bf 2 -preset veryfast {clip}")
+        if rc:
+            print(out)
+            return 1
+    print("software decoding")
+    rc, out = sh(f"ffmpeg -hide_banner -loglevel error -y -i {clip} -f rawvideo -pix_fmt nv12 {sw}")
+    if rc:
+        print(out)
+        return 1
+    print(f"hardware decoding (h264_v4l2m2m), mode {mode}")
+    sh("dmesg -C")
+    if mode == "canvas-swap":
+        set_endian_test(True)
+    try:
+        rc = hw_decode(clip, hw)
+    finally:
+        if mode == "canvas-swap":
+            set_endian_test(False)
+    rc, out = sh("dmesg | grep -iE 'vdec|esparser|canvas|h264' | grep -v VIDIOC_")
+    print("dmesg:\n  " + (out.replace("\n", "\n  ") or "(nothing)"))
+    if not os.path.exists(hw):
+        print("RESULT: no hardware output")
+        return 1
+    return compare(hw, sw, w, h)
+
+
+def main():
+    a = sys.argv[1:]
+    if (not a or a[0] in ("info", "run", "regs", "bench")) and os.geteuid() != 0:
+        sys.exit("run as root")
+    if not a or a[0] == "info":
+        info()
+        return 0
+    if a[0] == "run":
+        return run(*a[1:4])
+    if a[0] == "bench":
+        return bench(*a[1:3])
+    if a[0] == "regs":
+        dev = find_decoder()
+        print("decoder open by:", "; ".join(holders(dev)) if dev else "no decoder device")
+        snapshot(None, "now")
+        return 0
+    if a[0] == "compare" and len(a) == 4:
+        w, h = (int(x) for x in a[3].split("x"))
+        return compare(a[1], a[2], w, h)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
