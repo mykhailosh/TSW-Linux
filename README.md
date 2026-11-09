@@ -126,6 +126,7 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
 | `mic/` | `snd-tsw-audin` driver, `tsw-mic-check` | `make WORK=<build folder>`, then `sh install.sh` |
 | `net/` | `tsw-mac` | `sh install.sh` |
 | `camera/` | `tsw-cam-diag.py`: clocks, receiver and sensor registers during a capture | copy, run as root |
+| `logo/` | `logo.bmp` (U-Boot boot logo), `make-logo.py` to make one from a picture | `sh install.sh` (`sh install.sh remove` = Crestron logo) |
 
 ## Hardware notes
 
@@ -139,6 +140,10 @@ Log in as `tsw` or `root` over SSH (address from DHCP), on the screen or through
   registers sit on the VPU bus, which stays on from U-Boot because of `clk_ignore_unused pd_ignore_unused`.
   The camera driver, clocks and sensor tuning come from
   [tsx-mainline/linux](https://github.com/tsx-mainline/linux), adapted to 6.12.
+- **Boot logo:** U-Boot's `prepare` loads `LOGO.BMP` from the card's FAT partition (1280×800, 24-bit BMP);
+  without the file it shows the Crestron logo from the eMMC `logo` partition, which is never written. The
+  original command is kept in `prepare_crestron`. `make-logo.py picture.png` centres a picture on black
+  (U-Boot clears the screen to black first). Verified on a panel.
 - **Service messages** are in English only.
 
 ## Checks after boot

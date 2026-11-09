@@ -41,6 +41,8 @@
 #   * Buttons: tsw-buttons grabs the touch device (EVIOCGRAB) and provides virtual devices (uinput).
 #   * Microphone: mainline has no AUDIN driver -> the mic/snd-tsw-audin.c module is built here too.
 #   * Camera: mainline has no CSI-2 receiver for Meson8 -> kernel patches 0003-0006 (not yet tested on a panel).
+#   * Boot logo: U-Boot "prepare" loads LOGO.BMP (logo/logo.bmp) from FAT, else the Crestron logo
+#     from the eMMC logo partition.
 #   * All service messages in the image are in English.
 # =============================================================================
 set -euo pipefail
@@ -461,6 +463,10 @@ if ! fatput 2>/dev/null; then
   mdel -i "$FAT" ::BOOT.IMG 2>/dev/null || mdel -i "$FAT" ::boot.img 2>/dev/null || true
   fatput || die "could not write the kernel/DTB to FAT"
 fi
+# boot logo: without the file U-Boot keeps showing the Crestron logo
+if [ -f "$HERE/logo/logo.bmp" ]; then
+  mcopy -o -i "$FAT" "$HERE/logo/logo.bmp" ::LOGO.BMP || warn "no room in FAT for the boot logo"
+fi
 mdir -i "$FAT" ::/ | sed 's/^/  /'
 
 # root filesystem
@@ -482,6 +488,17 @@ uenv "$OUT_IMG" set initargs "$INITARGS"
 for kv in fdt_high=0xffffffff boot_retry=0 golden_boot_retry=0 golden=0 bootdelay=3; do
   uenv "$OUT_IMG" set "${kv%%=*}" "${kv#*=}"
 done
+# boot logo from FAT (same command as logo/install.sh); the original prepare is kept in prepare_crestron
+if mdir -i "$FAT" ::LOGO.BMP >/dev/null 2>&1; then
+  LOGO_HEAD='video open; video clear; video dev bl_on;'
+  LOGO_LOAD='mmcinfo;if fatload mmc 0 ${loadaddr_logo} logo.bmp; then bmp display ${loadaddr_logo}; else '
+  PREP="$(uenv "$OUT_IMG" get prepare_crestron)"
+  [ -n "$PREP" ] || { PREP="$(uenv "$OUT_IMG" get prepare)"; uenv "$OUT_IMG" set prepare_crestron "$PREP"; }
+  case "$PREP" in
+    "$LOGO_HEAD"*) uenv "$OUT_IMG" set prepare "$LOGO_HEAD$LOGO_LOAD${PREP#"$LOGO_HEAD"} fi;" ;;
+    *) warn "unexpected U-Boot prepare: the Crestron logo stays" ;;
+  esac
+fi
 echo "  preboot = $(uenv "$OUT_IMG" get preboot | tail -c 60)"
 echo "  initargs = $(uenv "$OUT_IMG" get initargs)"
 
